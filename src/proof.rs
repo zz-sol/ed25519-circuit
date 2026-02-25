@@ -2,6 +2,8 @@ use crate::affine::{AffinePoint, ed25519_basepoint_affine};
 use crate::lookup::ByteLookupTable;
 use crate::trace::{build_affine_mul_trace, scalar_bit_le, verify_affine_mul_trace};
 use bincode::Options;
+use curve25519::edwards::CompressedEdwardsY;
+use curve25519::scalar::Scalar;
 use p3_air::{Air, AirBuilder, BaseAir, PairBuilder};
 use p3_baby_bear::BabyBear;
 use p3_challenger::{HashChallenger, SerializingChallenger32};
@@ -20,6 +22,7 @@ use p3_uni_stark::{
     verify_with_preprocessed,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -99,6 +102,7 @@ pub struct AffineMulProof {
     pub preprocessed_vk: AffineMulPreprocessedVk,
     pub settings: AffineMulProofSettings,
     pub output_compressed: [u8; 32],
+    pub statement_hash: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +124,7 @@ struct SerializableAffineMulProof {
     vk: SerializableVk,
     settings: AffineMulProofSettings,
     output_compressed: [u8; 32],
+    statement_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +462,32 @@ fn from_serializable_vk(vk: SerializableVk) -> AffineMulPreprocessedVk {
     }
 }
 
+fn statement_hash(
+    instance: AffineMulInstance,
+    output_compressed: [u8; 32],
+    settings: AffineMulProofSettings,
+    vk: &AffineMulPreprocessedVk,
+) -> Result<[u8; 32], String> {
+    let mut hasher = Sha256::new();
+    hasher.update(serialize_affine_mul_instance(&instance));
+    hasher.update(output_compressed);
+    hasher.update(
+        bincode::serialize(&settings)
+            .map_err(|e| format!("failed to serialize settings for statement hash: {e}"))?,
+    );
+    hasher.update(
+        bincode::serialize(&to_serializable_vk(vk))
+            .map_err(|e| format!("failed to serialize vk for statement hash: {e}"))?,
+    );
+    Ok(hasher.finalize().into())
+}
+
+fn reference_scalar_mul_output(instance: AffineMulInstance) -> Option<[u8; 32]> {
+    let base = CompressedEdwardsY(instance.base.compress()).decompress()?;
+    let scalar = Scalar::from_bytes_mod_order(instance.scalar_le_bytes);
+    Some((scalar * base).compress().to_bytes())
+}
+
 pub fn serialize_affine_mul_instance(instance: &AffineMulInstance) -> Vec<u8> {
     let mut out = Vec::with_capacity(96);
     out.extend_from_slice(&instance.base.to_uncompressed_bytes());
@@ -548,6 +579,7 @@ pub fn serialize_affine_mul_proof(proof: &AffineMulProof) -> Result<Vec<u8>, Str
         vk: to_serializable_vk(&proof.preprocessed_vk),
         settings: proof.settings,
         output_compressed: proof.output_compressed,
+        statement_hash: proof.statement_hash,
     };
     let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_PROOF_BYTES {
@@ -581,6 +613,7 @@ pub fn deserialize_affine_mul_proof(bytes: &[u8]) -> Result<AffineMulProof, Stri
         preprocessed_vk: from_serializable_vk(serializable.vk),
         settings: serializable.settings,
         output_compressed: serializable.output_compressed,
+        statement_hash: serializable.statement_hash,
     })
 }
 
@@ -603,7 +636,7 @@ pub fn verify_affine_mul_bundle(bundle: &AffineMulProofBundle) -> bool {
     let Ok(proof) = deserialize_affine_mul_proof(&bundle.sealed_proof) else {
         return false;
     };
-    verify_affine_mul(instance, &proof)
+    verify_affine_mul_attested(instance, &proof)
 }
 
 pub fn prove_affine_mul_bundle_compressed(
@@ -625,7 +658,7 @@ pub fn verify_affine_mul_bundle_auto(bundle: &AffineMulProofBundle) -> bool {
     let Ok(proof) = deserialize_affine_mul_proof(&bundle.sealed_proof) else {
         return false;
     };
-    verify_affine_mul(instance, &proof)
+    verify_affine_mul_attested(instance, &proof)
 }
 
 pub fn prove_affine_mul_bundle_v2(
@@ -662,7 +695,7 @@ pub fn verify_affine_mul_bundle_v2(bundle: &AffineMulProofBundleV2) -> bool {
     let Ok(proof) = deserialize_affine_mul_proof(&bundle.sealed_proof) else {
         return false;
     };
-    verify_affine_mul(instance, &proof)
+    verify_affine_mul_attested(instance, &proof)
 }
 
 pub fn serialize_affine_mul_bundle_v2(bundle: &AffineMulProofBundleV2) -> Result<Vec<u8>, String> {
@@ -817,6 +850,11 @@ pub fn prove_affine_mul_with_settings(
         .ok_or_else(|| "trace is empty".to_string())?
         .acc_after_select;
     let output_compressed = final_point.compress();
+    let reference_output = reference_scalar_mul_output(instance)
+        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
+    if output_compressed != reference_output {
+        return Err("output does not match reference scalar multiplication".to_string());
+    }
 
     let main = build_main_trace(&trace, &deltas);
     let preprocessed =
@@ -829,11 +867,13 @@ pub fn prove_affine_mul_with_settings(
             .ok_or_else(|| "failed to setup preprocessed data for affine mul proof".to_string())?;
 
     let proof = prove_with_preprocessed(&config, &air, main, &[], Some(&prover_data));
+    let statement_hash = statement_hash(instance, output_compressed, settings, &preprocessed_vk)?;
     Ok(AffineMulProof {
         proof,
         preprocessed_vk,
         settings,
         output_compressed,
+        statement_hash,
     })
 }
 
@@ -870,6 +910,71 @@ pub fn verify_affine_mul(instance: AffineMulInstance, proof: &AffineMulProof) ->
     verify_affine_mul_with_settings(instance, proof, policy)
 }
 
+pub fn verify_affine_mul_attested(instance: AffineMulInstance, proof: &AffineMulProof) -> bool {
+    let policy = AffineMulProofSettings::default();
+    if proof.settings != policy {
+        return false;
+    }
+    verify_affine_mul_attested_with_settings(instance, proof, policy)
+}
+
+pub fn verify_affine_mul_attested_with_settings(
+    instance: AffineMulInstance,
+    proof: &AffineMulProof,
+    settings: AffineMulProofSettings,
+) -> bool {
+    if !meets_minimum_policy(settings) || proof.settings != settings {
+        return false;
+    }
+    if !instance.base.is_on_curve() || !instance.base.is_in_prime_order_subgroup() {
+        return false;
+    }
+    let expected_hash = match statement_hash(
+        instance,
+        proof.output_compressed,
+        settings,
+        &proof.preprocessed_vk,
+    ) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    if expected_hash != proof.statement_hash {
+        return false;
+    }
+    let preprocessed = build_preprocessed_trace(
+        instance.scalar_le_bytes,
+        &build_affine_mul_trace(instance.base, instance.scalar_le_bytes),
+        // This value only gates final-row checks in preprocessed columns.
+        // It must match what was bound in statement_hash.
+        match AffinePoint::from_compressed_bytes_strict(proof.output_compressed) {
+            Some(p) => p,
+            None => return false,
+        },
+        &{
+            let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
+            let byte_table = ByteLookupTable::default();
+            let mut deltas = Vec::with_capacity(trace.len());
+            for (row, step) in trace.iter().enumerate() {
+                let Ok(delta) = row_logup_deltas(row, step, &byte_table) else {
+                    return false;
+                };
+                deltas.push(delta);
+            }
+            deltas
+        },
+    );
+    let air = AffineMulAir::new(preprocessed);
+    let config = setup_config(settings);
+    verify_with_preprocessed(
+        &config,
+        &air,
+        &proof.proof,
+        &[],
+        Some(&proof.preprocessed_vk),
+    )
+    .is_ok()
+}
+
 pub fn verify_affine_mul_with_settings(
     instance: AffineMulInstance,
     proof: &AffineMulProof,
@@ -888,6 +993,12 @@ pub fn verify_affine_mul_with_settings(
         None => return false,
     };
     if final_point.compress() != proof.output_compressed {
+        return false;
+    }
+    let Some(reference_output) = reference_scalar_mul_output(instance) else {
+        return false;
+    };
+    if reference_output != proof.output_compressed {
         return false;
     }
 
@@ -1079,6 +1190,17 @@ mod tests {
         let decoded = deserialize_affine_mul_proof(&bytes).expect("deserialize");
         assert!(verify_affine_mul(instance, &decoded));
         assert_eq!(decoded.output_compressed, proof.output_compressed);
+    }
+
+    #[test]
+    fn affine_mul_attested_verify_rejects_tampered_statement_hash() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine().scalar_mul(scalar_from_u64(3)),
+            scalar_le_bytes: scalar_from_u64(88),
+        };
+        let mut proof = prove_affine_mul(instance).expect("prove");
+        proof.statement_hash[0] ^= 1;
+        assert!(!verify_affine_mul_attested(instance, &proof));
     }
 
     #[test]
