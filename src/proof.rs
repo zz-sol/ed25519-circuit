@@ -154,7 +154,10 @@ impl Display for AffineMulCodecError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidInstanceLength { expected, got } => {
-                write!(f, "invalid affine mul instance length: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "invalid affine mul instance length: expected {expected}, got {got}"
+                )
             }
             Self::InvalidCompressedInstanceLength { expected, got } => write!(
                 f,
@@ -708,12 +711,18 @@ pub fn recode_affine_mul_bundle_v2_instance(
     target_encoding: AffineMulInstanceEncoding,
 ) -> Result<AffineMulProofBundleV2, String> {
     let instance = match bundle.instance_encoding {
-        AffineMulInstanceEncoding::Uncompressed => deserialize_affine_mul_instance(&bundle.sealed_instance),
-        AffineMulInstanceEncoding::Compressed => deserialize_affine_mul_instance_compressed(&bundle.sealed_instance),
+        AffineMulInstanceEncoding::Uncompressed => {
+            deserialize_affine_mul_instance(&bundle.sealed_instance)
+        }
+        AffineMulInstanceEncoding::Compressed => {
+            deserialize_affine_mul_instance_compressed(&bundle.sealed_instance)
+        }
     }?;
     let sealed_instance = match target_encoding {
         AffineMulInstanceEncoding::Uncompressed => serialize_affine_mul_instance(&instance),
-        AffineMulInstanceEncoding::Compressed => serialize_affine_mul_instance_compressed(&instance),
+        AffineMulInstanceEncoding::Compressed => {
+            serialize_affine_mul_instance_compressed(&instance)
+        }
     };
     Ok(AffineMulProofBundleV2 {
         instance_encoding: target_encoding,
@@ -1042,7 +1051,8 @@ mod tests {
             }
         );
 
-        let err = try_deserialize_affine_mul_instance_compressed(&[0_u8; 63]).expect_err("must fail");
+        let err =
+            try_deserialize_affine_mul_instance_compressed(&[0_u8; 63]).expect_err("must fail");
         assert_eq!(
             err,
             AffineMulCodecError::InvalidCompressedInstanceLength {
@@ -1052,7 +1062,10 @@ mod tests {
         );
 
         let err = try_deserialize_affine_mul_instance_auto(&[0_u8; 65]).expect_err("must fail");
-        assert_eq!(err, AffineMulCodecError::InvalidAutoInstanceLength { got: 65 });
+        assert_eq!(
+            err,
+            AffineMulCodecError::InvalidAutoInstanceLength { got: 65 }
+        );
     }
 
     #[test]
@@ -1151,7 +1164,10 @@ mod tests {
         };
         let v1 = prove_affine_mul_bundle(instance).expect("v1");
         let v2 = upgrade_affine_mul_bundle_to_v2(&v1).expect("upgrade");
-        assert_eq!(v2.instance_encoding, AffineMulInstanceEncoding::Uncompressed);
+        assert_eq!(
+            v2.instance_encoding,
+            AffineMulInstanceEncoding::Uncompressed
+        );
         assert!(verify_affine_mul_bundle_v2(&v2));
         let downgraded = downgrade_affine_mul_bundle_v2(&v2);
         assert_eq!(downgraded, v1);
@@ -1164,19 +1180,19 @@ mod tests {
             base: ed25519_basepoint_affine().scalar_mul(scalar_from_u64(66)),
             scalar_le_bytes: scalar_from_u64(3434),
         };
-        let v2_u =
-            prove_affine_mul_bundle_v2(instance, AffineMulInstanceEncoding::Uncompressed)
-                .expect("v2");
+        let v2_u = prove_affine_mul_bundle_v2(instance, AffineMulInstanceEncoding::Uncompressed)
+            .expect("v2");
         let v2_c =
             recode_affine_mul_bundle_v2_instance(&v2_u, AffineMulInstanceEncoding::Compressed)
                 .expect("recode");
-        assert_eq!(v2_c.instance_encoding, AffineMulInstanceEncoding::Compressed);
+        assert_eq!(
+            v2_c.instance_encoding,
+            AffineMulInstanceEncoding::Compressed
+        );
         assert!(verify_affine_mul_bundle_v2(&v2_c));
-        let v2_u_back = recode_affine_mul_bundle_v2_instance(
-            &v2_c,
-            AffineMulInstanceEncoding::Uncompressed,
-        )
-        .expect("recode back");
+        let v2_u_back =
+            recode_affine_mul_bundle_v2_instance(&v2_c, AffineMulInstanceEncoding::Uncompressed)
+                .expect("recode back");
         assert!(verify_affine_mul_bundle_v2(&v2_u_back));
     }
 

@@ -156,6 +156,28 @@ fn modulus_limbs() -> [u32; LIMBS] {
 mod tests {
     use super::*;
 
+    fn next_u64(state: &mut u64) -> u64 {
+        // xorshift64*
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn random_fe(state: &mut u64) -> NonNativeFieldElement {
+        loop {
+            let mut bytes = [0_u8; 32];
+            for chunk in bytes.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&next_u64(state).to_le_bytes());
+            }
+            // Sample in [0, 2^255) and reject if not canonical for ed25519 field.
+            bytes[31] &= 0x7f;
+            if let Some(fe) = NonNativeFieldElement::from_ed25519_le_bytes_strict(bytes) {
+                return fe;
+            }
+        }
+    }
+
     #[test]
     fn add_sub_roundtrip() {
         let a = NonNativeFieldElement::from_u32(42);
@@ -193,5 +215,52 @@ mod tests {
         ];
         assert!(NonNativeFieldElement::from_ed25519_le_bytes_strict(p_minus_1).is_some());
         assert!(NonNativeFieldElement::from_ed25519_le_bytes_strict(p).is_none());
+    }
+
+    #[test]
+    fn random_add_sub_roundtrip_many() {
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..512 {
+            let a = random_fe(&mut state);
+            let b = random_fe(&mut state);
+            assert_eq!(a.add(b).sub(b), a);
+            assert_eq!(a.sub(b).add(b), a);
+        }
+    }
+
+    #[test]
+    fn random_mul_matches_biguint_reference() {
+        let mut state = 0xD1B5_4A32_D192_ED03;
+        let p = modulus();
+        for _ in 0..512 {
+            let a = random_fe(&mut state);
+            let b = random_fe(&mut state);
+            let got = a.mul(b).to_biguint();
+            let want = (a.to_biguint() * b.to_biguint()) % &p;
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn random_square_matches_mul_self() {
+        let mut state = 0xA24B_AED4_963E_E407;
+        for _ in 0..512 {
+            let a = random_fe(&mut state);
+            assert_eq!(a.square(), a.mul(a));
+        }
+    }
+
+    #[test]
+    fn random_inv_roundtrip_for_non_zero() {
+        let mut state = 0x3C79_AC49_2BA7_B653;
+        for _ in 0..512 {
+            let mut a = random_fe(&mut state);
+            if a.is_zero() {
+                a = NonNativeFieldElement::one();
+            }
+            let inv = a.inv();
+            assert_eq!(a.mul(inv), NonNativeFieldElement::one());
+            assert_eq!(inv.mul(a), NonNativeFieldElement::one());
+        }
     }
 }

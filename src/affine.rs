@@ -274,8 +274,8 @@ fn sqrt_mod_p(n: BigUint) -> Option<BigUint> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curve25519::edwards::CompressedEdwardsY;
     use curve25519::constants::ED25519_BASEPOINT_TABLE;
+    use curve25519::edwards::CompressedEdwardsY;
     use curve25519::scalar::Scalar;
 
     #[test]
@@ -394,12 +394,20 @@ mod tests {
     #[test]
     fn compressed_decode_matches_curve25519_sol_for_samples() {
         let base = ed25519_basepoint_affine();
-        let samples = [[1_u8; 32], [2_u8; 32], [7_u8; 32], [42_u8; 32], [200_u8; 32]];
+        let samples = [
+            [1_u8; 32],
+            [2_u8; 32],
+            [7_u8; 32],
+            [42_u8; 32],
+            [200_u8; 32],
+        ];
         for scalar_bytes in samples {
             let p = base.scalar_mul(scalar_bytes);
             let enc = p.compress();
             let ours = AffinePoint::from_compressed_bytes_strict(enc).expect("ours decode");
-            let theirs = CompressedEdwardsY(enc).decompress().expect("curve25519 decode");
+            let theirs = CompressedEdwardsY(enc)
+                .decompress()
+                .expect("curve25519 decode");
             assert_eq!(ours.compress(), theirs.compress().to_bytes());
         }
     }
