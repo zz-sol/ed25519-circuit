@@ -5,6 +5,7 @@ pub mod lookup;
 pub mod non_native;
 pub mod proof;
 pub mod trace;
+pub mod sound_nonnative;
 
 pub use affine::{AffineAddWitness, AffinePoint, ed25519_basepoint_affine};
 pub use non_native::NonNativeFieldElement;
@@ -26,5 +27,16 @@ pub use proof::{
     verify_affine_mul_batch, verify_affine_mul_bundle, verify_affine_mul_bundle_auto,
     verify_affine_mul_bundle_v2, verify_affine_mul_with_settings, verify_basepoint_affine_mul,
     verify_basepoint_affine_mul_with_settings,
+};
+pub use sound_nonnative::{
+    SoundAddSubProof, SoundAddSubProofSettings, SoundMulModProof, SoundMulProof,
+    SoundReduceProof, prove_nonnative_add,
+    prove_nonnative_add_with_settings, prove_nonnative_sub, prove_nonnative_sub_with_settings,
+    prove_nonnative_mul, prove_nonnative_mul_mod_p, prove_nonnative_mul_mod_p_with_settings,
+    prove_nonnative_mul_with_settings, prove_nonnative_reduce, prove_nonnative_reduce_with_settings,
+    verify_nonnative_add, verify_nonnative_add_with_settings, verify_nonnative_sub,
+    verify_nonnative_sub_with_settings, verify_nonnative_mul, verify_nonnative_mul_mod_p,
+    verify_nonnative_mul_mod_p_with_settings, verify_nonnative_mul_with_settings,
+    verify_nonnative_reduce, verify_nonnative_reduce_with_settings,
 };
 pub use trace::{AffineMulTraceStep, build_affine_mul_trace, verify_affine_mul_trace};
