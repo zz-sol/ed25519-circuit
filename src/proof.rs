@@ -462,8 +462,17 @@ pub fn serialize_affine_mul_instance(instance: &AffineMulInstance) -> Vec<u8> {
 }
 
 pub fn deserialize_affine_mul_instance(bytes: &[u8]) -> Result<AffineMulInstance, String> {
+    try_deserialize_affine_mul_instance(bytes).map_err(|e| e.to_string())
+}
+
+pub fn try_deserialize_affine_mul_instance(
+    bytes: &[u8],
+) -> Result<AffineMulInstance, AffineMulCodecError> {
     if bytes.len() != 96 {
-        return Err("invalid affine mul instance length".to_string());
+        return Err(AffineMulCodecError::InvalidInstanceLength {
+            expected: 96,
+            got: bytes.len(),
+        });
     }
     let mut point_bytes = [0_u8; 64];
     let mut scalar = [0_u8; 32];
@@ -471,7 +480,7 @@ pub fn deserialize_affine_mul_instance(bytes: &[u8]) -> Result<AffineMulInstance
     scalar.copy_from_slice(&bytes[64..96]);
 
     let base = AffinePoint::from_uncompressed_bytes_strict(point_bytes)
-        .ok_or_else(|| "invalid affine base encoding".to_string())?;
+        .ok_or(AffineMulCodecError::InvalidAffineBaseEncoding)?;
     Ok(AffineMulInstance {
         base,
         scalar_le_bytes: scalar,
@@ -488,15 +497,24 @@ pub fn serialize_affine_mul_instance_compressed(instance: &AffineMulInstance) ->
 pub fn deserialize_affine_mul_instance_compressed(
     bytes: &[u8],
 ) -> Result<AffineMulInstance, String> {
+    try_deserialize_affine_mul_instance_compressed(bytes).map_err(|e| e.to_string())
+}
+
+pub fn try_deserialize_affine_mul_instance_compressed(
+    bytes: &[u8],
+) -> Result<AffineMulInstance, AffineMulCodecError> {
     if bytes.len() != 64 {
-        return Err("invalid compressed affine mul instance length".to_string());
+        return Err(AffineMulCodecError::InvalidCompressedInstanceLength {
+            expected: 64,
+            got: bytes.len(),
+        });
     }
     let mut base_bytes = [0_u8; 32];
     let mut scalar = [0_u8; 32];
     base_bytes.copy_from_slice(&bytes[..32]);
     scalar.copy_from_slice(&bytes[32..64]);
     let base = AffinePoint::from_compressed_bytes_strict(base_bytes)
-        .ok_or_else(|| "invalid compressed affine base encoding".to_string())?;
+        .ok_or(AffineMulCodecError::InvalidCompressedAffineBaseEncoding)?;
     Ok(AffineMulInstance {
         base,
         scalar_le_bytes: scalar,
@@ -504,10 +522,16 @@ pub fn deserialize_affine_mul_instance_compressed(
 }
 
 pub fn deserialize_affine_mul_instance_auto(bytes: &[u8]) -> Result<AffineMulInstance, String> {
+    try_deserialize_affine_mul_instance_auto(bytes).map_err(|e| e.to_string())
+}
+
+pub fn try_deserialize_affine_mul_instance_auto(
+    bytes: &[u8],
+) -> Result<AffineMulInstance, AffineMulCodecError> {
     match bytes.len() {
-        64 => deserialize_affine_mul_instance_compressed(bytes),
-        96 => deserialize_affine_mul_instance(bytes),
-        _ => Err("invalid affine mul instance length".to_string()),
+        64 => try_deserialize_affine_mul_instance_compressed(bytes),
+        96 => try_deserialize_affine_mul_instance(bytes),
+        _ => Err(AffineMulCodecError::InvalidAutoInstanceLength { got: bytes.len() }),
     }
 }
 
@@ -1005,6 +1029,30 @@ mod tests {
             deserialize_affine_mul_instance_auto(&compressed).expect("decode compressed"),
             instance
         );
+    }
+
+    #[test]
+    fn typed_decode_errors_are_specific() {
+        let err = try_deserialize_affine_mul_instance(&[0_u8; 95]).expect_err("must fail");
+        assert_eq!(
+            err,
+            AffineMulCodecError::InvalidInstanceLength {
+                expected: 96,
+                got: 95
+            }
+        );
+
+        let err = try_deserialize_affine_mul_instance_compressed(&[0_u8; 63]).expect_err("must fail");
+        assert_eq!(
+            err,
+            AffineMulCodecError::InvalidCompressedInstanceLength {
+                expected: 64,
+                got: 63
+            }
+        );
+
+        let err = try_deserialize_affine_mul_instance_auto(&[0_u8; 65]).expect_err("must fail");
+        assert_eq!(err, AffineMulCodecError::InvalidAutoInstanceLength { got: 65 });
     }
 
     #[test]
