@@ -131,10 +131,19 @@ impl AffinePoint {
         bytes
     }
 
-    pub fn from_compressed_bytes_strict(mut bytes: [u8; 32]) -> Option<Self> {
+    fn from_compressed_bytes_inner(
+        mut bytes: [u8; 32],
+        canonical_y: bool,
+        require_prime_subgroup: bool,
+        require_zero_sign_for_x_zero: bool,
+    ) -> Option<Self> {
         let x_sign = (bytes[31] >> 7) & 1;
         bytes[31] &= 0x7f;
-        let y = NonNativeFieldElement::from_ed25519_le_bytes_strict(bytes)?;
+        let y = if canonical_y {
+            NonNativeFieldElement::from_ed25519_le_bytes_strict(bytes)?
+        } else {
+            NonNativeFieldElement::from_ed25519_le_bytes(bytes)
+        };
 
         let one = NonNativeFieldElement::one();
         let y2 = y.square();
@@ -146,8 +155,7 @@ impl AffinePoint {
         let parity = x.clone() & BigUint::one();
         let want = BigUint::from(x_sign);
         if x.is_zero() {
-            // Canonical encoding requires sign bit 0 when x == 0.
-            if x_sign == 1 {
+            if require_zero_sign_for_x_zero && x_sign == 1 {
                 return None;
             }
         } else if parity != want {
@@ -158,10 +166,21 @@ impl AffinePoint {
             x: NonNativeFieldElement::from_biguint(x),
             y,
         };
-        if !p.is_on_curve() || !p.is_in_prime_order_subgroup() {
+        if !p.is_on_curve() {
+            return None;
+        }
+        if require_prime_subgroup && !p.is_in_prime_order_subgroup() {
             return None;
         }
         Some(p)
+    }
+
+    pub fn from_compressed_bytes_strict(bytes: [u8; 32]) -> Option<Self> {
+        Self::from_compressed_bytes_inner(bytes, true, true, true)
+    }
+
+    pub fn from_compressed_bytes_relaxed(bytes: [u8; 32]) -> Option<Self> {
+        Self::from_compressed_bytes_inner(bytes, false, false, false)
     }
 
     pub fn is_in_prime_order_subgroup(self) -> bool {

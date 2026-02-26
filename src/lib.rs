@@ -4,6 +4,7 @@ pub mod affine;
 pub mod lookup;
 pub mod non_native;
 pub mod proof;
+pub mod signature;
 pub mod sound_affine;
 pub mod sound_nonnative;
 pub mod trace;
@@ -53,6 +54,15 @@ pub use proof::{
     verify_basepoint_affine_mul_e2e_unified_with_settings, verify_basepoint_affine_mul_fully_sound,
     verify_basepoint_affine_mul_fully_sound_with_settings, verify_basepoint_affine_mul_sound,
     verify_basepoint_affine_mul_with_settings,
+};
+pub use signature::{
+    Ed25519SignatureEquationProof, Ed25519SignatureProofSettings, Ed25519VerificationPolicy,
+    add_scalars_mod_l, decode_point_with_policy, derive_ed25519_challenge_scalar_mod_l,
+    deserialize_ed25519_signature_equation_proof, is_canonical_scalar_mod_l, mul_scalars_mod_l,
+    prove_ed25519_signature_equation, prove_ed25519_signature_equation_with_settings,
+    reduce_wide_scalar_mod_l, scalar_order_le_bytes, serialize_ed25519_signature_equation_proof,
+    verify_ed25519_signature_equation, verify_ed25519_signature_equation_native,
+    verify_ed25519_signature_equation_with_settings,
 };
 pub use sound_affine::{
     SoundAffineAddProof, prove_affine_add_sound, prove_affine_add_sound_with_settings,
