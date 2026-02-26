@@ -1,5 +1,9 @@
 use crate::affine::{AffinePoint, ed25519_basepoint_affine};
 use crate::lookup::ByteLookupTable;
+use crate::sound_affine::{
+    SoundAffineAddProof, prove_affine_add_sound_with_settings, verify_affine_add_sound_with_settings,
+};
+use crate::sound_nonnative::SoundAddSubProofSettings;
 use crate::trace::{build_affine_mul_trace, scalar_bit_le, verify_affine_mul_trace};
 use bincode::Options;
 use curve25519::edwards::CompressedEdwardsY;
@@ -56,6 +60,14 @@ const COL_PREP_FINAL_Y_BASE: usize = 146;
 const COL_PREP_LOGUP_DELTA_X: usize = 162;
 const COL_PREP_LOGUP_DELTA_Y: usize = 163;
 
+const CORE_PREP_WIDTH: usize = 36;
+const COL_CORE_PREP_BIT: usize = 0;
+const COL_CORE_PREP_FINAL_SELECTOR: usize = 1;
+const COL_CORE_PREP_FINAL_X_BASE: usize = 2;
+const COL_CORE_PREP_FINAL_Y_BASE: usize = 18;
+const COL_CORE_PREP_LOGUP_DELTA_X: usize = 34;
+const COL_CORE_PREP_LOGUP_DELTA_Y: usize = 35;
+
 pub type Val = BabyBear;
 type ByteHash = Keccak256Hash;
 type FieldHash = SerializingHasher<ByteHash>;
@@ -103,6 +115,37 @@ pub struct AffineMulProof {
     pub settings: AffineMulProofSettings,
     pub output_compressed: [u8; 32],
     pub statement_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineMulSoundProofSettings {
+    pub core: AffineMulProofSettings,
+    pub arithmetic: SoundAddSubProofSettings,
+    pub sampled_rows: usize,
+}
+
+impl Default for AffineMulSoundProofSettings {
+    fn default() -> Self {
+        Self {
+            core: AffineMulProofSettings::default(),
+            arithmetic: SoundAddSubProofSettings::default(),
+            sampled_rows: 1,
+        }
+    }
+}
+
+pub struct AffineMulSampledSoundProof {
+    pub core: AffineMulProof,
+    pub sampled_rows: Vec<usize>,
+    pub double_proofs: Vec<SoundAffineAddProof>,
+    pub add_proofs: Vec<SoundAffineAddProof>,
+}
+
+pub struct AffineMulFullySoundProof {
+    pub sampled_rows: Vec<usize>,
+    pub double_proofs: Vec<SoundAffineAddProof>,
+    pub add_proofs: Vec<SoundAffineAddProof>,
+    pub output_compressed: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,6 +328,99 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct AffineMulCoreAir {
+    preprocessed: RowMajorMatrix<Val>,
+}
+
+impl AffineMulCoreAir {
+    pub fn new(preprocessed: RowMajorMatrix<Val>) -> Self {
+        Self { preprocessed }
+    }
+}
+
+impl BaseAir<Val> for AffineMulCoreAir {
+    fn width(&self) -> usize {
+        MAIN_WIDTH
+    }
+
+    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<Val>> {
+        Some(self.preprocessed.clone())
+    }
+}
+
+impl<AB> Air<AB> for AffineMulCoreAir
+where
+    AB: AirBuilder<F = Val> + PairBuilder,
+{
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let prep = builder.preprocessed();
+        let local = main.row_slice(0).expect("local row");
+        let next = main.row_slice(1).expect("next row");
+        let local_prep = prep.row_slice(0).expect("local preprocessed row");
+
+        let bit = local_prep[COL_CORE_PREP_BIT].clone();
+        let final_sel = local_prep[COL_CORE_PREP_FINAL_SELECTOR].clone();
+        let logup_delta_x = local_prep[COL_CORE_PREP_LOGUP_DELTA_X].clone();
+        let logup_delta_y = local_prep[COL_CORE_PREP_LOGUP_DELTA_Y].clone();
+        let logup_acc_x = local[COL_LOGUP_ACC_X].clone();
+        let logup_acc_y = local[COL_LOGUP_ACC_Y].clone();
+        builder.assert_bool(bit.clone());
+        builder.assert_bool(final_sel.clone());
+
+        for i in 0..16 {
+            let double_x = local[COL_ACC_DOUBLE_X + i].clone();
+            let double_y = local[COL_ACC_DOUBLE_Y + i].clone();
+            let add_x = local[COL_ACC_ADD_X + i].clone();
+            let add_y = local[COL_ACC_ADD_Y + i].clone();
+            let select_x = local[COL_ACC_SELECT_X + i].clone();
+            let select_y = local[COL_ACC_SELECT_Y + i].clone();
+
+            builder.assert_zero(
+                select_x.clone() - (bit.clone() * add_x + (AB::Expr::ONE - bit.clone()) * double_x),
+            );
+            builder.assert_zero(
+                select_y.clone() - (bit.clone() * add_y + (AB::Expr::ONE - bit.clone()) * double_y),
+            );
+
+            let expected_final_x = local_prep[COL_CORE_PREP_FINAL_X_BASE + i].clone();
+            let expected_final_y = local_prep[COL_CORE_PREP_FINAL_Y_BASE + i].clone();
+            builder.assert_zero(final_sel.clone() * (select_x - expected_final_x));
+            builder.assert_zero(final_sel.clone() * (select_y - expected_final_y));
+
+            let mut transition = builder.when_transition();
+            transition.assert_zero(
+                next[COL_ACC_BEFORE_X + i].clone() - local[COL_ACC_SELECT_X + i].clone(),
+            );
+            transition.assert_zero(
+                next[COL_ACC_BEFORE_Y + i].clone() - local[COL_ACC_SELECT_Y + i].clone(),
+            );
+        }
+
+        let mut transition = builder.when_transition();
+        transition.assert_zero(logup_acc_x.clone() - logup_delta_x - next[COL_LOGUP_ACC_X].clone());
+        transition.assert_zero(logup_acc_y.clone() - logup_delta_y - next[COL_LOGUP_ACC_Y].clone());
+
+        builder.assert_zero(
+            final_sel.clone() * (logup_acc_x - local_prep[COL_CORE_PREP_LOGUP_DELTA_X].clone()),
+        );
+        builder.assert_zero(
+            final_sel.clone() * (logup_acc_y - local_prep[COL_CORE_PREP_LOGUP_DELTA_Y].clone()),
+        );
+
+        let mut first = builder.when_first_row();
+        first.assert_zero(local[COL_ACC_BEFORE_X].clone());
+        first.assert_zero(local[COL_ACC_BEFORE_Y].clone() - AB::Expr::ONE);
+        first.assert_zero(local[COL_LOGUP_ACC_X].clone());
+        first.assert_zero(local[COL_LOGUP_ACC_Y].clone());
+        for i in 1..16 {
+            first.assert_zero(local[COL_ACC_BEFORE_X + i].clone());
+            first.assert_zero(local[COL_ACC_BEFORE_Y + i].clone());
+        }
+    }
+}
+
 fn setup_config(settings: AffineMulProofSettings) -> AffineMulStarkConfig {
     let byte_hash = ByteHash {};
     let field_hash = FieldHash::new(byte_hash);
@@ -442,6 +578,36 @@ fn build_preprocessed_trace(
     RowMajorMatrix::new(values, PREP_WIDTH)
 }
 
+fn build_core_preprocessed_trace(
+    scalar_le_bytes: [u8; 32],
+    trace: &[crate::trace::AffineMulTraceStep],
+    final_point: AffinePoint,
+    deltas: &[(Val, Val)],
+) -> RowMajorMatrix<Val> {
+    let mut values = Vec::with_capacity(trace.len() * CORE_PREP_WIDTH);
+    let final_x = final_point.x.limbs_u32();
+    let final_y = final_point.y.limbs_u32();
+
+    for (row, step) in trace.iter().enumerate() {
+        let bit = scalar_bit_le(&scalar_le_bytes, step.bit_index);
+        values.push(Val::from_bool(bit == 1));
+
+        let is_last = row + 1 == trace.len();
+        values.push(Val::from_bool(is_last));
+
+        for i in 0..16 {
+            values.push(Val::from_u32(if is_last { final_x[i] } else { 0 }));
+        }
+        for i in 0..16 {
+            values.push(Val::from_u32(if is_last { final_y[i] } else { 0 }));
+        }
+        values.push(deltas[row].0);
+        values.push(deltas[row].1);
+    }
+
+    RowMajorMatrix::new(values, CORE_PREP_WIDTH)
+}
+
 fn vk_matches(a: &AffineMulPreprocessedVk, b: &AffineMulPreprocessedVk) -> bool {
     a.commitment == b.commitment && a.degree_bits == b.degree_bits && a.width == b.width
 }
@@ -486,6 +652,57 @@ fn reference_scalar_mul_output(instance: AffineMulInstance) -> Option<[u8; 32]> 
     let base = CompressedEdwardsY(instance.base.compress()).decompress()?;
     let scalar = Scalar::from_bytes_mod_order(instance.scalar_le_bytes);
     Some((scalar * base).compress().to_bytes())
+}
+
+fn sample_rows_evenly(total_rows: usize, sample_count: usize) -> Vec<usize> {
+    if total_rows == 0 || sample_count == 0 {
+        return Vec::new();
+    }
+    if sample_count >= total_rows {
+        return (0..total_rows).collect();
+    }
+    let mut rows = Vec::with_capacity(sample_count);
+    for i in 0..sample_count {
+        rows.push((i * total_rows) / sample_count);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+fn build_full_arithmetic_chain(
+    instance: AffineMulInstance,
+    arithmetic_settings: SoundAddSubProofSettings,
+) -> Result<(Vec<usize>, Vec<SoundAffineAddProof>, Vec<SoundAffineAddProof>, [u8; 32]), String> {
+    let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
+    let sampled_rows = (0..trace.len()).collect::<Vec<_>>();
+    let mut double_proofs = Vec::with_capacity(trace.len());
+    let mut add_proofs = Vec::with_capacity(trace.len());
+
+    for (row, step) in trace.iter().enumerate() {
+        let double_proof =
+            prove_affine_add_sound_with_settings(step.acc_before, step.acc_before, arithmetic_settings)?;
+        if double_proof.out != step.acc_after_double {
+            return Err(format!("double proof output mismatch at row {row}"));
+        }
+        let add_proof = prove_affine_add_sound_with_settings(
+            step.acc_after_double,
+            instance.base,
+            arithmetic_settings,
+        )?;
+        if add_proof.out != step.acc_after_add_base {
+            return Err(format!("add proof output mismatch at row {row}"));
+        }
+        double_proofs.push(double_proof);
+        add_proofs.push(add_proof);
+    }
+
+    let output_compressed = trace
+        .last()
+        .ok_or_else(|| "trace is empty".to_string())?
+        .acc_after_select
+        .compress();
+    Ok((sampled_rows, double_proofs, add_proofs, output_compressed))
 }
 
 pub fn serialize_affine_mul_instance(instance: &AffineMulInstance) -> Vec<u8> {
@@ -1035,6 +1252,325 @@ pub fn verify_affine_mul_with_settings(
     .is_ok()
 }
 
+fn prove_affine_mul_core_with_settings(
+    instance: AffineMulInstance,
+    settings: AffineMulProofSettings,
+) -> Result<AffineMulProof, String> {
+    if !meets_minimum_policy(settings) {
+        return Err("proof settings do not meet minimum verifier policy".to_string());
+    }
+    if !instance.base.is_on_curve() {
+        return Err("base point is not on ed25519 curve".to_string());
+    }
+    if !instance.base.is_in_prime_order_subgroup() {
+        return Err("base point is not in the prime-order subgroup".to_string());
+    }
+
+    let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
+    let byte_table = ByteLookupTable::default();
+    if !verify_affine_mul_trace(&trace, instance.base, instance.scalar_le_bytes, &byte_table) {
+        return Err("internal trace consistency check failed".to_string());
+    }
+    let mut deltas = Vec::with_capacity(trace.len());
+    for (row, step) in trace.iter().enumerate() {
+        deltas.push(row_logup_deltas(row, step, &byte_table)?);
+    }
+
+    let final_point = trace
+        .last()
+        .ok_or_else(|| "trace is empty".to_string())?
+        .acc_after_select;
+    let output_compressed = final_point.compress();
+    let reference_output = reference_scalar_mul_output(instance)
+        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
+    if output_compressed != reference_output {
+        return Err("output does not match reference scalar multiplication".to_string());
+    }
+
+    let main = build_main_trace(&trace, &deltas);
+    let preprocessed =
+        build_core_preprocessed_trace(instance.scalar_le_bytes, &trace, final_point, &deltas);
+    let air = AffineMulCoreAir::new(preprocessed);
+    let config = setup_config(settings);
+
+    let (prover_data, preprocessed_vk) =
+        setup_preprocessed::<AffineMulStarkConfig, _>(&config, &air, DEGREE_BITS)
+            .ok_or_else(|| "failed to setup preprocessed data for affine mul proof".to_string())?;
+
+    let proof = prove_with_preprocessed(&config, &air, main, &[], Some(&prover_data));
+    let statement_hash = statement_hash(instance, output_compressed, settings, &preprocessed_vk)?;
+    Ok(AffineMulProof {
+        proof,
+        preprocessed_vk,
+        settings,
+        output_compressed,
+        statement_hash,
+    })
+}
+
+fn verify_affine_mul_core_with_settings(
+    instance: AffineMulInstance,
+    proof: &AffineMulProof,
+    settings: AffineMulProofSettings,
+) -> bool {
+    if !meets_minimum_policy(settings) || proof.settings != settings {
+        return false;
+    }
+    if !instance.base.is_on_curve() || !instance.base.is_in_prime_order_subgroup() {
+        return false;
+    }
+
+    let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
+    let final_point = match trace.last() {
+        Some(last) => last.acc_after_select,
+        None => return false,
+    };
+    if final_point.compress() != proof.output_compressed {
+        return false;
+    }
+    let Some(reference_output) = reference_scalar_mul_output(instance) else {
+        return false;
+    };
+    if reference_output != proof.output_compressed {
+        return false;
+    }
+
+    let mut deltas = Vec::with_capacity(trace.len());
+    let byte_table = ByteLookupTable::default();
+    for (row, step) in trace.iter().enumerate() {
+        let Ok(delta) = row_logup_deltas(row, step, &byte_table) else {
+            return false;
+        };
+        deltas.push(delta);
+    }
+    let preprocessed =
+        build_core_preprocessed_trace(instance.scalar_le_bytes, &trace, final_point, &deltas);
+    let air = AffineMulCoreAir::new(preprocessed);
+    let config = setup_config(settings);
+
+    let Some((_, expected_vk)) =
+        setup_preprocessed::<AffineMulStarkConfig, _>(&config, &air, DEGREE_BITS)
+    else {
+        return false;
+    };
+
+    if !vk_matches(&expected_vk, &proof.preprocessed_vk) {
+        return false;
+    }
+
+    verify_with_preprocessed(
+        &config,
+        &air,
+        &proof.proof,
+        &[],
+        Some(&proof.preprocessed_vk),
+    )
+    .is_ok()
+}
+
+pub fn prove_affine_mul_sound(
+    instance: AffineMulInstance,
+) -> Result<AffineMulSampledSoundProof, String> {
+    prove_affine_mul_sound_with_settings(instance, AffineMulSoundProofSettings::default())
+}
+
+pub fn prove_affine_mul_sound_with_settings(
+    instance: AffineMulInstance,
+    settings: AffineMulSoundProofSettings,
+) -> Result<AffineMulSampledSoundProof, String> {
+    if settings.sampled_rows > 256 {
+        return Err("sampled_rows must be <= 256".to_string());
+    }
+    let core = prove_affine_mul_core_with_settings(instance, settings.core)?;
+    let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
+    let sampled_rows = sample_rows_evenly(trace.len(), settings.sampled_rows);
+    let mut double_proofs = Vec::with_capacity(sampled_rows.len());
+    let mut add_proofs = Vec::with_capacity(sampled_rows.len());
+
+    for &row in &sampled_rows {
+        let step = trace
+            .get(row)
+            .ok_or_else(|| format!("sampled row out of bounds: {row}"))?;
+        let double_proof = prove_affine_add_sound_with_settings(
+            step.acc_before,
+            step.acc_before,
+            settings.arithmetic,
+        )?;
+        if double_proof.out != step.acc_after_double {
+            return Err(format!("double proof output mismatch at row {row}"));
+        }
+        let add_proof = prove_affine_add_sound_with_settings(
+            step.acc_after_double,
+            instance.base,
+            settings.arithmetic,
+        )?;
+        if add_proof.out != step.acc_after_add_base {
+            return Err(format!("add proof output mismatch at row {row}"));
+        }
+        double_proofs.push(double_proof);
+        add_proofs.push(add_proof);
+    }
+
+    Ok(AffineMulSampledSoundProof {
+        core,
+        sampled_rows,
+        double_proofs,
+        add_proofs,
+    })
+}
+
+pub fn verify_affine_mul_sound(
+    instance: AffineMulInstance,
+    proof: &AffineMulSampledSoundProof,
+) -> bool {
+    verify_affine_mul_sound_with_settings(instance, proof, AffineMulSoundProofSettings::default())
+}
+
+pub fn verify_affine_mul_sound_with_settings(
+    instance: AffineMulInstance,
+    proof: &AffineMulSampledSoundProof,
+    settings: AffineMulSoundProofSettings,
+) -> bool {
+    if proof.sampled_rows.len() != proof.double_proofs.len()
+        || proof.sampled_rows.len() != proof.add_proofs.len()
+    {
+        return false;
+    }
+    if !verify_affine_mul_core_with_settings(instance, &proof.core, settings.core) {
+        return false;
+    }
+    let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
+    let expected_rows = sample_rows_evenly(trace.len(), settings.sampled_rows);
+    if proof.sampled_rows != expected_rows {
+        return false;
+    }
+
+    for (i, &row) in proof.sampled_rows.iter().enumerate() {
+        let Some(step) = trace.get(row) else {
+            return false;
+        };
+        let double_proof = &proof.double_proofs[i];
+        if double_proof.lhs != step.acc_before
+            || double_proof.rhs != step.acc_before
+            || double_proof.out != step.acc_after_double
+            || !verify_affine_add_sound_with_settings(double_proof, settings.arithmetic)
+        {
+            return false;
+        }
+
+        let add_proof = &proof.add_proofs[i];
+        if add_proof.lhs != step.acc_after_double
+            || add_proof.rhs != instance.base
+            || add_proof.out != step.acc_after_add_base
+            || !verify_affine_add_sound_with_settings(add_proof, settings.arithmetic)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn prove_affine_mul_fully_sound(
+    instance: AffineMulInstance,
+) -> Result<AffineMulFullySoundProof, String> {
+    let settings = AffineMulSoundProofSettings::default();
+    let (sampled_rows, double_proofs, add_proofs, output_compressed) =
+        build_full_arithmetic_chain(instance, settings.arithmetic)?;
+    let reference_output = reference_scalar_mul_output(instance)
+        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
+    if output_compressed != reference_output {
+        return Err("output does not match reference scalar multiplication".to_string());
+    }
+    Ok(AffineMulFullySoundProof {
+        sampled_rows,
+        double_proofs,
+        add_proofs,
+        output_compressed,
+    })
+}
+
+pub fn prove_affine_mul_fully_sound_strict(
+    instance: AffineMulInstance,
+) -> Result<AffineMulFullySoundProof, String> {
+    let settings = AffineMulSoundProofSettings::default();
+    let (sampled_rows, double_proofs, add_proofs, output_compressed) =
+        build_full_arithmetic_chain(instance, settings.arithmetic)?;
+    let reference_output = reference_scalar_mul_output(instance)
+        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
+    if output_compressed != reference_output {
+        return Err("output does not match reference scalar multiplication".to_string());
+    }
+    Ok(AffineMulFullySoundProof {
+        sampled_rows,
+        double_proofs,
+        add_proofs,
+        output_compressed,
+    })
+}
+
+pub fn verify_affine_mul_fully_sound(
+    instance: AffineMulInstance,
+    proof: &AffineMulFullySoundProof,
+) -> bool {
+    verify_affine_mul_fully_sound_strict(instance, proof)
+}
+
+pub fn verify_affine_mul_fully_sound_strict(
+    instance: AffineMulInstance,
+    proof: &AffineMulFullySoundProof,
+) -> bool {
+    let settings = AffineMulSoundProofSettings {
+        sampled_rows: 256,
+        ..AffineMulSoundProofSettings::default()
+    };
+    if proof.sampled_rows.len() != 256
+        || proof.double_proofs.len() != 256
+        || proof.add_proofs.len() != 256
+    {
+        return false;
+    }
+    for (i, row) in proof.sampled_rows.iter().enumerate() {
+        if *row != i {
+            return false;
+        }
+    }
+    let mut acc = AffinePoint::identity();
+    for row in 0..256usize {
+        let double_proof = &proof.double_proofs[row];
+        if double_proof.lhs != acc
+            || double_proof.rhs != acc
+            || !verify_affine_add_sound_with_settings(double_proof, settings.arithmetic)
+        {
+            return false;
+        }
+
+        let add_proof = &proof.add_proofs[row];
+        if add_proof.lhs != double_proof.out
+            || add_proof.rhs != instance.base
+            || !verify_affine_add_sound_with_settings(add_proof, settings.arithmetic)
+        {
+            return false;
+        }
+
+        let bit_index = 255 - row;
+        let bit = scalar_bit_le(&instance.scalar_le_bytes, bit_index);
+        acc = if bit == 1 {
+            add_proof.out
+        } else {
+            double_proof.out
+        };
+    }
+
+    let expected = match reference_scalar_mul_output(instance) {
+        Some(v) => v,
+        None => return false,
+    };
+    if acc.compress() != expected || proof.output_compressed != expected {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,6 +1713,62 @@ mod tests {
             err,
             AffineMulCodecError::InvalidAutoInstanceLength { got: 65 }
         );
+    }
+
+    #[test]
+    fn sample_rows_evenly_is_stable() {
+        assert_eq!(sample_rows_evenly(256, 0), Vec::<usize>::new());
+        assert_eq!(sample_rows_evenly(8, 3), vec![0, 2, 5]);
+        assert_eq!(sample_rows_evenly(4, 10), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    #[ignore = "expensive end-to-end proof; run explicitly when needed"]
+    fn affine_mul_fully_sound_roundtrip() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar_from_u64(5),
+        };
+        let proof = prove_affine_mul_fully_sound(instance).expect("prove");
+        assert!(verify_affine_mul_fully_sound(instance, &proof));
+        assert_eq!(proof.sampled_rows.len(), 256);
+    }
+
+    #[test]
+    fn affine_mul_fully_sound_rejects_bad_row_indices() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar_from_u64(7),
+        };
+        let mut proof = prove_affine_mul_fully_sound(instance).expect("prove");
+        proof.sampled_rows[0] = 1;
+        assert!(!verify_affine_mul_fully_sound(instance, &proof));
+    }
+
+    #[test]
+    fn sampled_sound_verify_rejects_tampered_core_proof() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar_from_u64(9),
+        };
+        let mut proof = prove_affine_mul_sound(instance).expect("prove");
+        proof.core.settings.rng_seed ^= 1;
+        assert!(!verify_affine_mul_sound(instance, &proof));
+    }
+
+    #[test]
+    fn fully_sound_strict_verify_rejects_structural_mismatch() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar_from_u64(1),
+        };
+        let proof = AffineMulFullySoundProof {
+            sampled_rows: vec![0],
+            double_proofs: Vec::new(),
+            add_proofs: Vec::new(),
+            output_compressed: [0_u8; 32],
+        };
+        assert!(!verify_affine_mul_fully_sound_strict(instance, &proof));
     }
 
     #[test]
