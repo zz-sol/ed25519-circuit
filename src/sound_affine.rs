@@ -32,6 +32,7 @@ pub struct SoundAffineAddProof {
 }
 
 const MAX_SOUND_AFFINE_PROOF_BYTES: usize = 128 * 1024 * 1024;
+const TAG_SOUND_AFFINE_ADD_PROOF: &[u8; 4] = b"SAAP";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SerializableSoundAffineAddProof {
@@ -71,6 +72,28 @@ fn encode_point(p: AffinePoint) -> Vec<u8> {
     p.to_uncompressed_bytes().to_vec()
 }
 
+fn encode_with_tag(tag: &[u8; 4], payload: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&payload);
+    out
+}
+
+fn split_tagged_payload<'a>(
+    bytes: &'a [u8],
+    expected_tag: &[u8; 4],
+    size_limit: usize,
+    what: &str,
+) -> Result<&'a [u8], String> {
+    if bytes.len() > size_limit {
+        return Err(format!("{what} exceeds configured size limit"));
+    }
+    if bytes.len() < 4 || &bytes[..4] != expected_tag {
+        return Err(format!("invalid {what} codec header"));
+    }
+    Ok(&bytes[4..])
+}
+
 fn decode_point(bytes: &[u8]) -> Result<AffinePoint, String> {
     if bytes.len() != 64 {
         return Err("invalid affine point byte length".to_string());
@@ -102,7 +125,8 @@ pub fn serialize_sound_affine_add_proof(proof: &SoundAffineAddProof) -> Result<V
         out_x: serialize_sound_mul_mod_proof(&proof.out_x)?,
         out_y: serialize_sound_mul_mod_proof(&proof.out_y)?,
     };
-    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    let payload = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    let bytes = encode_with_tag(TAG_SOUND_AFFINE_ADD_PROOF, payload);
     if bytes.len() > MAX_SOUND_AFFINE_PROOF_BYTES {
         return Err("serialized sound affine add proof exceeds configured size limit".to_string());
     }
@@ -110,15 +134,18 @@ pub fn serialize_sound_affine_add_proof(proof: &SoundAffineAddProof) -> Result<V
 }
 
 pub fn deserialize_sound_affine_add_proof(bytes: &[u8]) -> Result<SoundAffineAddProof, String> {
-    if bytes.len() > MAX_SOUND_AFFINE_PROOF_BYTES {
-        return Err("serialized sound affine add proof exceeds configured size limit".to_string());
-    }
+    let payload = split_tagged_payload(
+        bytes,
+        TAG_SOUND_AFFINE_ADD_PROOF,
+        MAX_SOUND_AFFINE_PROOF_BYTES,
+        "sound affine add proof",
+    )?;
     let opts = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
-        .with_limit(MAX_SOUND_AFFINE_PROOF_BYTES as u64);
+        .with_limit((MAX_SOUND_AFFINE_PROOF_BYTES - 4) as u64);
     let serializable: SerializableSoundAffineAddProof =
-        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+        opts.deserialize(payload).map_err(|e| e.to_string())?;
     Ok(SoundAffineAddProof {
         settings: serializable.settings,
         lhs: decode_point(&serializable.lhs)?,
@@ -340,5 +367,32 @@ mod tests {
         let mut proof = prove_affine_add_sound(lhs, rhs).expect("prove");
         proof.out_x.reduce.r[0] ^= 1;
         assert!(!verify_affine_add_sound(&proof));
+    }
+
+    #[test]
+    fn sound_affine_add_codec_roundtrip() {
+        let base = ed25519_basepoint_affine();
+        let lhs = base.scalar_mul(scalar_from_u64(9));
+        let rhs = base.scalar_mul(scalar_from_u64(10));
+        let proof = prove_affine_add_sound(lhs, rhs).expect("prove");
+        let bytes = serialize_sound_affine_add_proof(&proof).expect("encode");
+        let decoded = deserialize_sound_affine_add_proof(&bytes).expect("decode");
+        assert!(verify_affine_add_sound(&decoded));
+        assert_eq!(decoded.out, lhs.add(rhs));
+    }
+
+    #[test]
+    fn sound_affine_add_codec_rejects_bad_header() {
+        let base = ed25519_basepoint_affine();
+        let lhs = base.scalar_mul(scalar_from_u64(1));
+        let rhs = base.scalar_mul(scalar_from_u64(2));
+        let proof = prove_affine_add_sound(lhs, rhs).expect("prove");
+        let mut bytes = serialize_sound_affine_add_proof(&proof).expect("encode");
+        bytes[0] ^= 1;
+        let err = match deserialize_sound_affine_add_proof(&bytes) {
+            Ok(_) => panic!("must fail"),
+            Err(e) => e,
+        };
+        assert!(err.contains("codec header"));
     }
 }
