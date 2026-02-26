@@ -1104,7 +1104,7 @@ pub fn verify_affine_mul_bundle(bundle: &AffineMulProofBundle) -> bool {
     let Ok(proof) = deserialize_affine_mul_proof(&bundle.sealed_proof) else {
         return false;
     };
-    verify_affine_mul_attested(instance, &proof)
+    verify_affine_mul(instance, &proof)
 }
 
 pub fn prove_affine_mul_bundle_compressed(
@@ -1126,7 +1126,7 @@ pub fn verify_affine_mul_bundle_auto(bundle: &AffineMulProofBundle) -> bool {
     let Ok(proof) = deserialize_affine_mul_proof(&bundle.sealed_proof) else {
         return false;
     };
-    verify_affine_mul_attested(instance, &proof)
+    verify_affine_mul(instance, &proof)
 }
 
 pub fn prove_affine_mul_bundle_v2(
@@ -1163,7 +1163,7 @@ pub fn verify_affine_mul_bundle_v2(bundle: &AffineMulProofBundleV2) -> bool {
     let Ok(proof) = deserialize_affine_mul_proof(&bundle.sealed_proof) else {
         return false;
     };
-    verify_affine_mul_attested(instance, &proof)
+    verify_affine_mul(instance, &proof)
 }
 
 pub fn serialize_affine_mul_bundle_v2(bundle: &AffineMulProofBundleV2) -> Result<Vec<u8>, String> {
@@ -1183,53 +1183,6 @@ pub fn deserialize_affine_mul_bundle_v2(bytes: &[u8]) -> Result<AffineMulProofBu
         .reject_trailing_bytes()
         .with_limit((2 * MAX_PROOF_BYTES) as u64);
     opts.deserialize(bytes).map_err(|e| e.to_string())
-}
-
-pub fn upgrade_affine_mul_bundle_to_v2(
-    bundle: &AffineMulProofBundle,
-) -> Result<AffineMulProofBundleV2, String> {
-    let instance_encoding = match bundle.sealed_instance.len() {
-        96 => AffineMulInstanceEncoding::Uncompressed,
-        64 => AffineMulInstanceEncoding::Compressed,
-        _ => return Err("invalid affine mul instance length".to_string()),
-    };
-    Ok(AffineMulProofBundleV2 {
-        instance_encoding,
-        sealed_instance: bundle.sealed_instance.clone(),
-        sealed_proof: bundle.sealed_proof.clone(),
-    })
-}
-
-pub fn downgrade_affine_mul_bundle_v2(bundle: &AffineMulProofBundleV2) -> AffineMulProofBundle {
-    AffineMulProofBundle {
-        sealed_instance: bundle.sealed_instance.clone(),
-        sealed_proof: bundle.sealed_proof.clone(),
-    }
-}
-
-pub fn recode_affine_mul_bundle_v2_instance(
-    bundle: &AffineMulProofBundleV2,
-    target_encoding: AffineMulInstanceEncoding,
-) -> Result<AffineMulProofBundleV2, String> {
-    let instance = match bundle.instance_encoding {
-        AffineMulInstanceEncoding::Uncompressed => {
-            deserialize_affine_mul_instance(&bundle.sealed_instance)
-        }
-        AffineMulInstanceEncoding::Compressed => {
-            deserialize_affine_mul_instance_compressed(&bundle.sealed_instance)
-        }
-    }?;
-    let sealed_instance = match target_encoding {
-        AffineMulInstanceEncoding::Uncompressed => serialize_affine_mul_instance(&instance),
-        AffineMulInstanceEncoding::Compressed => {
-            serialize_affine_mul_instance_compressed(&instance)
-        }
-    };
-    Ok(AffineMulProofBundleV2 {
-        instance_encoding: target_encoding,
-        sealed_instance,
-        sealed_proof: bundle.sealed_proof.clone(),
-    })
 }
 
 pub fn serialize_affine_mul_bundle(bundle: &AffineMulProofBundle) -> Result<Vec<u8>, String> {
@@ -1723,71 +1676,6 @@ pub fn verify_affine_mul(instance: AffineMulInstance, proof: &AffineMulProof) ->
         return false;
     }
     verify_affine_mul_with_settings(instance, proof, policy)
-}
-
-pub fn verify_affine_mul_attested(instance: AffineMulInstance, proof: &AffineMulProof) -> bool {
-    let policy = AffineMulProofSettings::default();
-    if proof.settings != policy {
-        return false;
-    }
-    verify_affine_mul_attested_with_settings(instance, proof, policy)
-}
-
-pub fn verify_affine_mul_attested_with_settings(
-    instance: AffineMulInstance,
-    proof: &AffineMulProof,
-    settings: AffineMulProofSettings,
-) -> bool {
-    if !meets_minimum_policy(settings) || proof.settings != settings {
-        return false;
-    }
-    if !instance.base.is_on_curve() || !instance.base.is_in_prime_order_subgroup() {
-        return false;
-    }
-    let expected_hash = match statement_hash(
-        instance,
-        proof.output_compressed,
-        settings,
-        &proof.preprocessed_vk,
-    ) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    if expected_hash != proof.statement_hash {
-        return false;
-    }
-    let preprocessed = build_preprocessed_trace(
-        instance.scalar_le_bytes,
-        &build_affine_mul_trace(instance.base, instance.scalar_le_bytes),
-        // This value only gates final-row checks in preprocessed columns.
-        // It must match what was bound in statement_hash.
-        match AffinePoint::from_compressed_bytes_strict(proof.output_compressed) {
-            Some(p) => p,
-            None => return false,
-        },
-        &{
-            let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
-            let byte_table = ByteLookupTable::default();
-            let mut deltas = Vec::with_capacity(trace.len());
-            for (row, step) in trace.iter().enumerate() {
-                let Ok(delta) = row_logup_deltas(row, step, &byte_table) else {
-                    return false;
-                };
-                deltas.push(delta);
-            }
-            deltas
-        },
-    );
-    let air = AffineMulAir::new(preprocessed);
-    let config = setup_config(settings);
-    verify_with_preprocessed(
-        &config,
-        &air,
-        &proof.proof,
-        &[],
-        Some(&proof.preprocessed_vk),
-    )
-    .is_ok()
 }
 
 pub fn verify_affine_mul_with_settings(
@@ -2672,14 +2560,14 @@ mod tests {
     }
 
     #[test]
-    fn affine_mul_attested_verify_rejects_tampered_statement_hash() {
+    fn affine_mul_verify_rejects_tampered_output() {
         let instance = AffineMulInstance {
             base: ed25519_basepoint_affine().scalar_mul(scalar_from_u64(3)),
             scalar_le_bytes: scalar_from_u64(88),
         };
         let mut proof = prove_affine_mul(instance).expect("prove");
-        proof.statement_hash[0] ^= 1;
-        assert!(!verify_affine_mul_attested(instance, &proof));
+        proof.output_compressed[0] ^= 1;
+        assert!(!verify_affine_mul(instance, &proof));
     }
 
     #[test]
@@ -2801,46 +2689,6 @@ mod tests {
         assert!(verify_affine_mul_bundle_v2(&bundle));
         bundle.sealed_proof[0] ^= 1;
         assert!(!verify_affine_mul_bundle_v2(&bundle));
-    }
-
-    #[test]
-    fn bundle_upgrade_and_downgrade_roundtrip() {
-        let instance = AffineMulInstance {
-            base: ed25519_basepoint_affine().scalar_mul(scalar_from_u64(55)),
-            scalar_le_bytes: scalar_from_u64(1212),
-        };
-        let v1 = prove_affine_mul_bundle(instance).expect("v1");
-        let v2 = upgrade_affine_mul_bundle_to_v2(&v1).expect("upgrade");
-        assert_eq!(
-            v2.instance_encoding,
-            AffineMulInstanceEncoding::Uncompressed
-        );
-        assert!(verify_affine_mul_bundle_v2(&v2));
-        let downgraded = downgrade_affine_mul_bundle_v2(&v2);
-        assert_eq!(downgraded, v1);
-        assert!(verify_affine_mul_bundle(&downgraded));
-    }
-
-    #[test]
-    fn bundle_v2_recode_instance_encoding_roundtrip() {
-        let instance = AffineMulInstance {
-            base: ed25519_basepoint_affine().scalar_mul(scalar_from_u64(66)),
-            scalar_le_bytes: scalar_from_u64(3434),
-        };
-        let v2_u = prove_affine_mul_bundle_v2(instance, AffineMulInstanceEncoding::Uncompressed)
-            .expect("v2");
-        let v2_c =
-            recode_affine_mul_bundle_v2_instance(&v2_u, AffineMulInstanceEncoding::Compressed)
-                .expect("recode");
-        assert_eq!(
-            v2_c.instance_encoding,
-            AffineMulInstanceEncoding::Compressed
-        );
-        assert!(verify_affine_mul_bundle_v2(&v2_c));
-        let v2_u_back =
-            recode_affine_mul_bundle_v2_instance(&v2_c, AffineMulInstanceEncoding::Uncompressed)
-                .expect("recode back");
-        assert!(verify_affine_mul_bundle_v2(&v2_u_back));
     }
 
     #[test]
