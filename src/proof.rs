@@ -1,7 +1,8 @@
 use crate::affine::{AffinePoint, ed25519_basepoint_affine};
 use crate::lookup::ByteLookupTable;
 use crate::sound_affine::{
-    SoundAffineAddProof, prove_affine_add_sound_with_settings, verify_affine_add_sound_with_settings,
+    SoundAffineAddProof, deserialize_sound_affine_add_proof, prove_affine_add_sound_with_settings,
+    serialize_sound_affine_add_proof, verify_affine_add_sound_with_settings,
 };
 use crate::sound_nonnative::SoundAddSubProofSettings;
 use crate::trace::{build_affine_mul_trace, scalar_bit_le, verify_affine_mul_trace};
@@ -81,6 +82,8 @@ type Pcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
 type Commitment = <Pcs as PcsTrait<Challenge, Challenger>>::Commitment;
 const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INNER_PROOF_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SAMPLED_SOUND_PROOF_BYTES: usize = 256 * 1024 * 1024;
+const MAX_FULLY_SOUND_PROOF_BYTES: usize = 512 * 1024 * 1024;
 
 pub type AffineMulStarkConfig = StarkConfig<Pcs, Challenge, Challenger>;
 pub type AffineMulStarkProof = Proof<AffineMulStarkConfig>;
@@ -117,7 +120,7 @@ pub struct AffineMulProof {
     pub statement_hash: [u8; 32],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AffineMulSoundProofSettings {
     pub core: AffineMulProofSettings,
     pub arithmetic: SoundAddSubProofSettings,
@@ -135,6 +138,8 @@ impl Default for AffineMulSoundProofSettings {
 }
 
 pub struct AffineMulSampledSoundProof {
+    pub settings: AffineMulSoundProofSettings,
+    pub statement_hash: [u8; 32],
     pub core: AffineMulProof,
     pub sampled_rows: Vec<usize>,
     pub double_proofs: Vec<SoundAffineAddProof>,
@@ -142,6 +147,8 @@ pub struct AffineMulSampledSoundProof {
 }
 
 pub struct AffineMulFullySoundProof {
+    pub arithmetic_settings: SoundAddSubProofSettings,
+    pub statement_hash: [u8; 32],
     pub sampled_rows: Vec<usize>,
     pub double_proofs: Vec<SoundAffineAddProof>,
     pub add_proofs: Vec<SoundAffineAddProof>,
@@ -168,6 +175,26 @@ struct SerializableAffineMulProof {
     settings: AffineMulProofSettings,
     output_compressed: [u8; 32],
     statement_hash: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializableAffineMulSampledSoundProof {
+    settings: AffineMulSoundProofSettings,
+    statement_hash: [u8; 32],
+    core_bytes: Vec<u8>,
+    sampled_rows: Vec<usize>,
+    double_proofs: Vec<Vec<u8>>,
+    add_proofs: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializableAffineMulFullySoundProof {
+    arithmetic_settings: SoundAddSubProofSettings,
+    statement_hash: [u8; 32],
+    sampled_rows: Vec<usize>,
+    double_proofs: Vec<Vec<u8>>,
+    add_proofs: Vec<Vec<u8>>,
+    output_compressed: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +697,54 @@ fn sample_rows_evenly(total_rows: usize, sample_count: usize) -> Vec<usize> {
     rows
 }
 
+fn meets_minimum_arithmetic_policy(settings: SoundAddSubProofSettings) -> bool {
+    settings.log_final_poly_len >= 4
+        && settings.log_blowup >= 3
+        && settings.num_queries >= 2
+        && settings.commit_proof_of_work_bits >= 1
+        && settings.query_proof_of_work_bits >= 1
+}
+
+fn sampled_sound_statement_hash(
+    instance: AffineMulInstance,
+    settings: AffineMulSoundProofSettings,
+    sampled_rows: &[usize],
+    core_statement_hash: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let mut hasher = Sha256::new();
+    hasher.update(serialize_affine_mul_instance(&instance));
+    hasher.update(
+        bincode::serialize(&settings)
+            .map_err(|e| format!("failed to serialize sampled sound settings: {e}"))?,
+    );
+    hasher.update(
+        bincode::serialize(sampled_rows)
+            .map_err(|e| format!("failed to serialize sampled rows: {e}"))?,
+    );
+    hasher.update(core_statement_hash);
+    Ok(hasher.finalize().into())
+}
+
+fn fully_sound_statement_hash(
+    instance: AffineMulInstance,
+    arithmetic_settings: SoundAddSubProofSettings,
+    sampled_rows: &[usize],
+    output_compressed: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let mut hasher = Sha256::new();
+    hasher.update(serialize_affine_mul_instance(&instance));
+    hasher.update(
+        bincode::serialize(&arithmetic_settings)
+            .map_err(|e| format!("failed to serialize arithmetic settings: {e}"))?,
+    );
+    hasher.update(
+        bincode::serialize(sampled_rows)
+            .map_err(|e| format!("failed to serialize sampled rows: {e}"))?,
+    );
+    hasher.update(output_compressed);
+    Ok(hasher.finalize().into())
+}
+
 fn build_full_arithmetic_chain(
     instance: AffineMulInstance,
     arithmetic_settings: SoundAddSubProofSettings,
@@ -831,6 +906,118 @@ pub fn deserialize_affine_mul_proof(bytes: &[u8]) -> Result<AffineMulProof, Stri
         settings: serializable.settings,
         output_compressed: serializable.output_compressed,
         statement_hash: serializable.statement_hash,
+    })
+}
+
+pub fn serialize_affine_mul_sampled_sound_proof(
+    proof: &AffineMulSampledSoundProof,
+) -> Result<Vec<u8>, String> {
+    let mut double_proofs = Vec::with_capacity(proof.double_proofs.len());
+    for p in &proof.double_proofs {
+        double_proofs.push(serialize_sound_affine_add_proof(p)?);
+    }
+    let mut add_proofs = Vec::with_capacity(proof.add_proofs.len());
+    for p in &proof.add_proofs {
+        add_proofs.push(serialize_sound_affine_add_proof(p)?);
+    }
+    let serializable = SerializableAffineMulSampledSoundProof {
+        settings: proof.settings,
+        statement_hash: proof.statement_hash,
+        core_bytes: serialize_affine_mul_proof(&proof.core)?,
+        sampled_rows: proof.sampled_rows.clone(),
+        double_proofs,
+        add_proofs,
+    };
+    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_SAMPLED_SOUND_PROOF_BYTES {
+        return Err("serialized sampled sound proof exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_affine_mul_sampled_sound_proof(
+    bytes: &[u8],
+) -> Result<AffineMulSampledSoundProof, String> {
+    if bytes.len() > MAX_SAMPLED_SOUND_PROOF_BYTES {
+        return Err("serialized sampled sound proof exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SAMPLED_SOUND_PROOF_BYTES as u64);
+    let serializable: SerializableAffineMulSampledSoundProof =
+        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+    let mut double_proofs = Vec::with_capacity(serializable.double_proofs.len());
+    for p in serializable.double_proofs {
+        double_proofs.push(deserialize_sound_affine_add_proof(&p)?);
+    }
+    let mut add_proofs = Vec::with_capacity(serializable.add_proofs.len());
+    for p in serializable.add_proofs {
+        add_proofs.push(deserialize_sound_affine_add_proof(&p)?);
+    }
+    Ok(AffineMulSampledSoundProof {
+        settings: serializable.settings,
+        statement_hash: serializable.statement_hash,
+        core: deserialize_affine_mul_proof(&serializable.core_bytes)?,
+        sampled_rows: serializable.sampled_rows,
+        double_proofs,
+        add_proofs,
+    })
+}
+
+pub fn serialize_affine_mul_fully_sound_proof(
+    proof: &AffineMulFullySoundProof,
+) -> Result<Vec<u8>, String> {
+    let mut double_proofs = Vec::with_capacity(proof.double_proofs.len());
+    for p in &proof.double_proofs {
+        double_proofs.push(serialize_sound_affine_add_proof(p)?);
+    }
+    let mut add_proofs = Vec::with_capacity(proof.add_proofs.len());
+    for p in &proof.add_proofs {
+        add_proofs.push(serialize_sound_affine_add_proof(p)?);
+    }
+    let serializable = SerializableAffineMulFullySoundProof {
+        arithmetic_settings: proof.arithmetic_settings,
+        statement_hash: proof.statement_hash,
+        sampled_rows: proof.sampled_rows.clone(),
+        double_proofs,
+        add_proofs,
+        output_compressed: proof.output_compressed,
+    };
+    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_FULLY_SOUND_PROOF_BYTES {
+        return Err("serialized fully sound proof exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_affine_mul_fully_sound_proof(
+    bytes: &[u8],
+) -> Result<AffineMulFullySoundProof, String> {
+    if bytes.len() > MAX_FULLY_SOUND_PROOF_BYTES {
+        return Err("serialized fully sound proof exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_FULLY_SOUND_PROOF_BYTES as u64);
+    let serializable: SerializableAffineMulFullySoundProof =
+        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+    let mut double_proofs = Vec::with_capacity(serializable.double_proofs.len());
+    for p in serializable.double_proofs {
+        double_proofs.push(deserialize_sound_affine_add_proof(&p)?);
+    }
+    let mut add_proofs = Vec::with_capacity(serializable.add_proofs.len());
+    for p in serializable.add_proofs {
+        add_proofs.push(deserialize_sound_affine_add_proof(&p)?);
+    }
+    Ok(AffineMulFullySoundProof {
+        arithmetic_settings: serializable.arithmetic_settings,
+        statement_hash: serializable.statement_hash,
+        sampled_rows: serializable.sampled_rows,
+        double_proofs,
+        add_proofs,
+        output_compressed: serializable.output_compressed,
     })
 }
 
@@ -1031,6 +1218,50 @@ pub fn prove_basepoint_affine_mul_with_settings(
             scalar_le_bytes,
         },
         settings,
+    )
+}
+
+pub fn prove_basepoint_affine_mul_sound(
+    scalar_le_bytes: [u8; 32],
+) -> Result<AffineMulSampledSoundProof, String> {
+    prove_affine_mul_sound(AffineMulInstance {
+        base: ed25519_basepoint_affine(),
+        scalar_le_bytes,
+    })
+}
+
+pub fn verify_basepoint_affine_mul_sound(
+    scalar_le_bytes: [u8; 32],
+    proof: &AffineMulSampledSoundProof,
+) -> bool {
+    verify_affine_mul_sound(
+        AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes,
+        },
+        proof,
+    )
+}
+
+pub fn prove_basepoint_affine_mul_fully_sound(
+    scalar_le_bytes: [u8; 32],
+) -> Result<AffineMulFullySoundProof, String> {
+    prove_affine_mul_fully_sound(AffineMulInstance {
+        base: ed25519_basepoint_affine(),
+        scalar_le_bytes,
+    })
+}
+
+pub fn verify_basepoint_affine_mul_fully_sound(
+    scalar_le_bytes: [u8; 32],
+    proof: &AffineMulFullySoundProof,
+) -> bool {
+    verify_affine_mul_fully_sound(
+        AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes,
+        },
+        proof,
     )
 }
 
@@ -1381,6 +1612,9 @@ pub fn prove_affine_mul_sound_with_settings(
     if settings.sampled_rows > 256 {
         return Err("sampled_rows must be <= 256".to_string());
     }
+    if !meets_minimum_policy(settings.core) || !meets_minimum_arithmetic_policy(settings.arithmetic) {
+        return Err("sound proof settings do not meet minimum verifier policy".to_string());
+    }
     let core = prove_affine_mul_core_with_settings(instance, settings.core)?;
     let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
     let sampled_rows = sample_rows_evenly(trace.len(), settings.sampled_rows);
@@ -1411,7 +1645,11 @@ pub fn prove_affine_mul_sound_with_settings(
         add_proofs.push(add_proof);
     }
 
+    let statement_hash =
+        sampled_sound_statement_hash(instance, settings, &sampled_rows, core.statement_hash)?;
     Ok(AffineMulSampledSoundProof {
+        settings,
+        statement_hash,
         core,
         sampled_rows,
         double_proofs,
@@ -1431,12 +1669,30 @@ pub fn verify_affine_mul_sound_with_settings(
     proof: &AffineMulSampledSoundProof,
     settings: AffineMulSoundProofSettings,
 ) -> bool {
+    if proof.settings != settings {
+        return false;
+    }
     if proof.sampled_rows.len() != proof.double_proofs.len()
         || proof.sampled_rows.len() != proof.add_proofs.len()
     {
         return false;
     }
+    if !meets_minimum_policy(settings.core) || !meets_minimum_arithmetic_policy(settings.arithmetic) {
+        return false;
+    }
     if !verify_affine_mul_core_with_settings(instance, &proof.core, settings.core) {
+        return false;
+    }
+    let expected_stmt = match sampled_sound_statement_hash(
+        instance,
+        settings,
+        &proof.sampled_rows,
+        proof.core.statement_hash,
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if proof.statement_hash != expected_stmt {
         return false;
     }
     let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
@@ -1473,34 +1729,29 @@ pub fn verify_affine_mul_sound_with_settings(
 pub fn prove_affine_mul_fully_sound(
     instance: AffineMulInstance,
 ) -> Result<AffineMulFullySoundProof, String> {
-    let settings = AffineMulSoundProofSettings::default();
-    let (sampled_rows, double_proofs, add_proofs, output_compressed) =
-        build_full_arithmetic_chain(instance, settings.arithmetic)?;
-    let reference_output = reference_scalar_mul_output(instance)
-        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
-    if output_compressed != reference_output {
-        return Err("output does not match reference scalar multiplication".to_string());
-    }
-    Ok(AffineMulFullySoundProof {
-        sampled_rows,
-        double_proofs,
-        add_proofs,
-        output_compressed,
-    })
+    prove_affine_mul_fully_sound_strict(instance)
 }
 
 pub fn prove_affine_mul_fully_sound_strict(
     instance: AffineMulInstance,
 ) -> Result<AffineMulFullySoundProof, String> {
     let settings = AffineMulSoundProofSettings::default();
+    if !instance.base.is_on_curve() {
+        return Err("base point is not on ed25519 curve".to_string());
+    }
+    if !instance.base.is_in_prime_order_subgroup() {
+        return Err("base point is not in the prime-order subgroup".to_string());
+    }
+    if !meets_minimum_arithmetic_policy(settings.arithmetic) {
+        return Err("arithmetic settings do not meet minimum verifier policy".to_string());
+    }
     let (sampled_rows, double_proofs, add_proofs, output_compressed) =
         build_full_arithmetic_chain(instance, settings.arithmetic)?;
-    let reference_output = reference_scalar_mul_output(instance)
-        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
-    if output_compressed != reference_output {
-        return Err("output does not match reference scalar multiplication".to_string());
-    }
+    let statement_hash =
+        fully_sound_statement_hash(instance, settings.arithmetic, &sampled_rows, output_compressed)?;
     Ok(AffineMulFullySoundProof {
+        arithmetic_settings: settings.arithmetic,
+        statement_hash,
         sampled_rows,
         double_proofs,
         add_proofs,
@@ -1519,10 +1770,12 @@ pub fn verify_affine_mul_fully_sound_strict(
     instance: AffineMulInstance,
     proof: &AffineMulFullySoundProof,
 ) -> bool {
-    let settings = AffineMulSoundProofSettings {
-        sampled_rows: 256,
-        ..AffineMulSoundProofSettings::default()
-    };
+    if !instance.base.is_on_curve() || !instance.base.is_in_prime_order_subgroup() {
+        return false;
+    }
+    if !meets_minimum_arithmetic_policy(proof.arithmetic_settings) {
+        return false;
+    }
     if proof.sampled_rows.len() != 256
         || proof.double_proofs.len() != 256
         || proof.add_proofs.len() != 256
@@ -1539,7 +1792,7 @@ pub fn verify_affine_mul_fully_sound_strict(
         let double_proof = &proof.double_proofs[row];
         if double_proof.lhs != acc
             || double_proof.rhs != acc
-            || !verify_affine_add_sound_with_settings(double_proof, settings.arithmetic)
+            || !verify_affine_add_sound_with_settings(double_proof, proof.arithmetic_settings)
         {
             return false;
         }
@@ -1547,7 +1800,7 @@ pub fn verify_affine_mul_fully_sound_strict(
         let add_proof = &proof.add_proofs[row];
         if add_proof.lhs != double_proof.out
             || add_proof.rhs != instance.base
-            || !verify_affine_add_sound_with_settings(add_proof, settings.arithmetic)
+            || !verify_affine_add_sound_with_settings(add_proof, proof.arithmetic_settings)
         {
             return false;
         }
@@ -1561,11 +1814,19 @@ pub fn verify_affine_mul_fully_sound_strict(
         };
     }
 
-    let expected = match reference_scalar_mul_output(instance) {
-        Some(v) => v,
-        None => return false,
+    if acc.compress() != proof.output_compressed {
+        return false;
+    }
+    let expected_stmt = match fully_sound_statement_hash(
+        instance,
+        proof.arithmetic_settings,
+        &proof.sampled_rows,
+        proof.output_compressed,
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
     };
-    if acc.compress() != expected || proof.output_compressed != expected {
+    if proof.statement_hash != expected_stmt {
         return false;
     }
     true
@@ -1757,18 +2018,71 @@ mod tests {
     }
 
     #[test]
+    fn sampled_sound_verify_rejects_tampered_statement_hash() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar_from_u64(10),
+        };
+        let mut proof = prove_affine_mul_sound(instance).expect("prove");
+        proof.statement_hash[0] ^= 1;
+        assert!(!verify_affine_mul_sound(instance, &proof));
+    }
+
+    #[test]
+    fn basepoint_sampled_sound_roundtrip() {
+        let scalar = scalar_from_u64(12);
+        let proof = prove_basepoint_affine_mul_sound(scalar).expect("prove");
+        assert!(verify_basepoint_affine_mul_sound(scalar, &proof));
+    }
+
+    #[test]
+    fn sampled_sound_proof_serialization_roundtrip() {
+        let scalar = scalar_from_u64(13);
+        let proof = prove_basepoint_affine_mul_sound(scalar).expect("prove");
+        let bytes = serialize_affine_mul_sampled_sound_proof(&proof).expect("encode");
+        let decoded = deserialize_affine_mul_sampled_sound_proof(&bytes).expect("decode");
+        assert!(verify_basepoint_affine_mul_sound(scalar, &decoded));
+    }
+
+    #[test]
     fn fully_sound_strict_verify_rejects_structural_mismatch() {
         let instance = AffineMulInstance {
             base: ed25519_basepoint_affine(),
             scalar_le_bytes: scalar_from_u64(1),
         };
         let proof = AffineMulFullySoundProof {
+            arithmetic_settings: SoundAddSubProofSettings::default(),
+            statement_hash: [0_u8; 32],
             sampled_rows: vec![0],
             double_proofs: Vec::new(),
             add_proofs: Vec::new(),
             output_compressed: [0_u8; 32],
         };
         assert!(!verify_affine_mul_fully_sound_strict(instance, &proof));
+    }
+
+    #[test]
+    fn fully_sound_verify_rejects_tampered_statement_hash() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar_from_u64(2),
+        };
+        let mut proof = prove_affine_mul_fully_sound(instance).expect("prove");
+        proof.statement_hash[0] ^= 1;
+        assert!(!verify_affine_mul_fully_sound(instance, &proof));
+    }
+
+    #[test]
+    #[ignore = "expensive end-to-end proof; run explicitly when needed"]
+    fn fully_sound_proof_serialization_roundtrip() {
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar_from_u64(4),
+        };
+        let proof = prove_affine_mul_fully_sound(instance).expect("prove");
+        let bytes = serialize_affine_mul_fully_sound_proof(&proof).expect("encode");
+        let decoded = deserialize_affine_mul_fully_sound_proof(&bytes).expect("decode");
+        assert!(verify_affine_mul_fully_sound(instance, &decoded));
     }
 
     #[test]
@@ -1813,6 +2127,52 @@ mod tests {
         let result = prove_affine_mul(instance);
         assert!(result.is_err());
         assert!(result.err().expect("err").contains("prime-order subgroup"));
+    }
+
+    #[test]
+    fn fully_sound_prove_rejects_low_order_base() {
+        let minus_one = NonNativeFieldElement::from_ed25519_le_bytes([
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ]);
+        let low_order = AffinePoint {
+            x: NonNativeFieldElement::zero(),
+            y: minus_one,
+        };
+        let instance = AffineMulInstance {
+            base: low_order,
+            scalar_le_bytes: scalar_from_u64(5),
+        };
+        let result = prove_affine_mul_fully_sound(instance);
+        assert!(result.is_err());
+        assert!(result.err().expect("err").contains("prime-order subgroup"));
+    }
+
+    #[test]
+    fn fully_sound_verify_rejects_low_order_base_instance() {
+        let proof = AffineMulFullySoundProof {
+            arithmetic_settings: SoundAddSubProofSettings::default(),
+            statement_hash: [0_u8; 32],
+            sampled_rows: Vec::new(),
+            double_proofs: Vec::new(),
+            add_proofs: Vec::new(),
+            output_compressed: [0_u8; 32],
+        };
+
+        let minus_one = NonNativeFieldElement::from_ed25519_le_bytes([
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ]);
+        let low_order_instance = AffineMulInstance {
+            base: AffinePoint {
+                x: NonNativeFieldElement::zero(),
+                y: minus_one,
+            },
+            scalar_le_bytes: scalar_from_u64(6),
+        };
+        assert!(!verify_affine_mul_fully_sound(low_order_instance, &proof));
     }
 
     #[test]

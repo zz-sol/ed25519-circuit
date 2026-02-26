@@ -2,13 +2,13 @@ use crate::non_native::NonNativeFieldElement;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AffinePoint {
     pub x: NonNativeFieldElement,
     pub y: NonNativeFieldElement,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AffineAddWitness {
     pub lhs: AffinePoint,
     pub rhs: AffinePoint,

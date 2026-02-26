@@ -1,8 +1,11 @@
+use bincode::Options;
 use crate::affine::AffinePoint;
 use crate::non_native::NonNativeFieldElement;
 use crate::sound_nonnative::{
-    SoundAddSubProof, SoundAddSubProofSettings, SoundMulModProof, prove_nonnative_add_with_settings,
-    prove_nonnative_mul_mod_p_with_settings, prove_nonnative_sub_with_settings,
+    SoundAddSubProof, SoundAddSubProofSettings, SoundMulModProof, deserialize_sound_add_sub_proof,
+    deserialize_sound_mul_mod_proof, prove_nonnative_add_with_settings,
+    prove_nonnative_mul_mod_p_with_settings, prove_nonnative_sub_with_settings, serialize_sound_add_sub_proof,
+    serialize_sound_mul_mod_proof,
     verify_nonnative_add_with_settings, verify_nonnative_mul_mod_p_with_settings,
     verify_nonnative_sub_with_settings,
 };
@@ -28,6 +31,30 @@ pub struct SoundAffineAddProof {
     pub out_y: SoundMulModProof,
 }
 
+const MAX_SOUND_AFFINE_PROOF_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableSoundAffineAddProof {
+    settings: SoundAddSubProofSettings,
+    lhs: Vec<u8>,
+    rhs: Vec<u8>,
+    out: Vec<u8>,
+    x1x2: Vec<u8>,
+    y1y2: Vec<u8>,
+    x1y2: Vec<u8>,
+    y1x2: Vec<u8>,
+    d_mul_x1x2: Vec<u8>,
+    dxxyy: Vec<u8>,
+    x_num: Vec<u8>,
+    y_num: Vec<u8>,
+    x_den: Vec<u8>,
+    y_den: Vec<u8>,
+    x_den_inv_check: Vec<u8>,
+    y_den_inv_check: Vec<u8>,
+    out_x: Vec<u8>,
+    out_y: Vec<u8>,
+}
+
 fn fe_bytes(x: NonNativeFieldElement) -> [u8; 32] {
     x.to_ed25519_le_bytes()
 }
@@ -38,6 +65,80 @@ fn one_bytes() -> [u8; 32] {
 
 fn d_bytes() -> [u8; 32] {
     AffinePoint::d().to_ed25519_le_bytes()
+}
+
+fn encode_point(p: AffinePoint) -> Vec<u8> {
+    p.to_uncompressed_bytes().to_vec()
+}
+
+fn decode_point(bytes: &[u8]) -> Result<AffinePoint, String> {
+    if bytes.len() != 64 {
+        return Err("invalid affine point byte length".to_string());
+    }
+    let mut raw = [0_u8; 64];
+    raw.copy_from_slice(bytes);
+    AffinePoint::from_uncompressed_bytes_strict(raw)
+        .ok_or_else(|| "invalid affine point encoding".to_string())
+}
+
+pub fn serialize_sound_affine_add_proof(proof: &SoundAffineAddProof) -> Result<Vec<u8>, String> {
+    let serializable = SerializableSoundAffineAddProof {
+        settings: proof.settings,
+        lhs: encode_point(proof.lhs),
+        rhs: encode_point(proof.rhs),
+        out: encode_point(proof.out),
+        x1x2: serialize_sound_mul_mod_proof(&proof.x1x2)?,
+        y1y2: serialize_sound_mul_mod_proof(&proof.y1y2)?,
+        x1y2: serialize_sound_mul_mod_proof(&proof.x1y2)?,
+        y1x2: serialize_sound_mul_mod_proof(&proof.y1x2)?,
+        d_mul_x1x2: serialize_sound_mul_mod_proof(&proof.d_mul_x1x2)?,
+        dxxyy: serialize_sound_mul_mod_proof(&proof.dxxyy)?,
+        x_num: serialize_sound_add_sub_proof(&proof.x_num)?,
+        y_num: serialize_sound_add_sub_proof(&proof.y_num)?,
+        x_den: serialize_sound_add_sub_proof(&proof.x_den)?,
+        y_den: serialize_sound_add_sub_proof(&proof.y_den)?,
+        x_den_inv_check: serialize_sound_mul_mod_proof(&proof.x_den_inv_check)?,
+        y_den_inv_check: serialize_sound_mul_mod_proof(&proof.y_den_inv_check)?,
+        out_x: serialize_sound_mul_mod_proof(&proof.out_x)?,
+        out_y: serialize_sound_mul_mod_proof(&proof.out_y)?,
+    };
+    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_SOUND_AFFINE_PROOF_BYTES {
+        return Err("serialized sound affine add proof exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_sound_affine_add_proof(bytes: &[u8]) -> Result<SoundAffineAddProof, String> {
+    if bytes.len() > MAX_SOUND_AFFINE_PROOF_BYTES {
+        return Err("serialized sound affine add proof exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_AFFINE_PROOF_BYTES as u64);
+    let serializable: SerializableSoundAffineAddProof =
+        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+    Ok(SoundAffineAddProof {
+        settings: serializable.settings,
+        lhs: decode_point(&serializable.lhs)?,
+        rhs: decode_point(&serializable.rhs)?,
+        out: decode_point(&serializable.out)?,
+        x1x2: deserialize_sound_mul_mod_proof(&serializable.x1x2)?,
+        y1y2: deserialize_sound_mul_mod_proof(&serializable.y1y2)?,
+        x1y2: deserialize_sound_mul_mod_proof(&serializable.x1y2)?,
+        y1x2: deserialize_sound_mul_mod_proof(&serializable.y1x2)?,
+        d_mul_x1x2: deserialize_sound_mul_mod_proof(&serializable.d_mul_x1x2)?,
+        dxxyy: deserialize_sound_mul_mod_proof(&serializable.dxxyy)?,
+        x_num: deserialize_sound_add_sub_proof(&serializable.x_num)?,
+        y_num: deserialize_sound_add_sub_proof(&serializable.y_num)?,
+        x_den: deserialize_sound_add_sub_proof(&serializable.x_den)?,
+        y_den: deserialize_sound_add_sub_proof(&serializable.y_den)?,
+        x_den_inv_check: deserialize_sound_mul_mod_proof(&serializable.x_den_inv_check)?,
+        y_den_inv_check: deserialize_sound_mul_mod_proof(&serializable.y_den_inv_check)?,
+        out_x: deserialize_sound_mul_mod_proof(&serializable.out_x)?,
+        out_y: deserialize_sound_mul_mod_proof(&serializable.out_y)?,
+    })
 }
 
 pub fn prove_affine_add_sound(

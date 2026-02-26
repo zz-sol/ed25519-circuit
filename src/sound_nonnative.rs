@@ -1,3 +1,4 @@
+use bincode::Options;
 use num_bigint::BigUint;
 use p3_air::{Air, AirBuilder, BaseAir};
 use p3_baby_bear::BabyBear;
@@ -54,6 +55,7 @@ const RED_COL_Q_BITS: usize = RED_COL_R_BITS + (32 * 8);
 const RED_COL_CARRY_BITS: usize = RED_COL_Q_BITS + (32 * 8);
 const RED_WIDTH: usize = RED_COL_CARRY_BITS + (65 * 24);
 const RED_CARRY_BIAS: u32 = 1 << 23;
+const MAX_SOUND_NONNATIVE_PROOF_BYTES: usize = 64 * 1024 * 1024;
 
 pub type Val = BabyBear;
 type ByteHash = Keccak256Hash;
@@ -69,7 +71,7 @@ type Pcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
 pub type SoundAddSubStarkConfig = StarkConfig<Pcs, Challenge, Challenger>;
 pub type SoundAddSubStarkProof = Proof<SoundAddSubStarkConfig>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SoundAddSubProofSettings {
     pub log_blowup: usize,
     pub log_final_poly_len: usize,
@@ -354,6 +356,40 @@ pub struct SoundMulModProof {
     pub reduce: SoundReduceProof,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableSoundAddSubProof {
+    proof_bytes: Vec<u8>,
+    settings: SoundAddSubProofSettings,
+    is_sub: bool,
+    a: [u8; 32],
+    b: [u8; 32],
+    c: [u8; 32],
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableSoundMulProof {
+    proof_bytes: Vec<u8>,
+    settings: SoundAddSubProofSettings,
+    a: [u8; 32],
+    b: [u8; 32],
+    d: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableSoundReduceProof {
+    proof_bytes: Vec<u8>,
+    settings: SoundAddSubProofSettings,
+    d: Vec<u8>,
+    q: [u8; 32],
+    r: [u8; 32],
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableSoundMulModProof {
+    mul_bytes: Vec<u8>,
+    reduce_bytes: Vec<u8>,
+}
+
 fn setup_config(settings: SoundAddSubProofSettings) -> SoundAddSubStarkConfig {
     let byte_hash = ByteHash {};
     let field_hash = FieldHash::new(byte_hash);
@@ -371,6 +407,171 @@ fn setup_config(settings: SoundAddSubProofSettings) -> SoundAddSubStarkConfig {
     let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params);
     let challenger = Challenger::from_hasher(settings.rng_seed.to_le_bytes().to_vec(), byte_hash);
     SoundAddSubStarkConfig::new(pcs, challenger)
+}
+
+pub fn serialize_sound_add_sub_proof(proof: &SoundAddSubProof) -> Result<Vec<u8>, String> {
+    let proof_bytes = bincode::serialize(&proof.proof).map_err(|e| e.to_string())?;
+    let serializable = SerializableSoundAddSubProof {
+        proof_bytes,
+        settings: proof.settings,
+        is_sub: proof.is_sub,
+        a: proof.a,
+        b: proof.b,
+        c: proof.c,
+    };
+    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound add/sub proof exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_sound_add_sub_proof(bytes: &[u8]) -> Result<SoundAddSubProof, String> {
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound add/sub proof exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_NONNATIVE_PROOF_BYTES as u64);
+    let serializable: SerializableSoundAddSubProof =
+        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+    let inner_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_NONNATIVE_PROOF_BYTES as u64);
+    let proof_inner: SoundAddSubStarkProof = inner_opts
+        .deserialize(&serializable.proof_bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(SoundAddSubProof {
+        proof: proof_inner,
+        settings: serializable.settings,
+        is_sub: serializable.is_sub,
+        a: serializable.a,
+        b: serializable.b,
+        c: serializable.c,
+    })
+}
+
+pub fn serialize_sound_mul_proof(proof: &SoundMulProof) -> Result<Vec<u8>, String> {
+    let proof_bytes = bincode::serialize(&proof.proof).map_err(|e| e.to_string())?;
+    let serializable = SerializableSoundMulProof {
+        proof_bytes,
+        settings: proof.settings,
+        a: proof.a,
+        b: proof.b,
+        d: proof.d.to_vec(),
+    };
+    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound mul proof exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_sound_mul_proof(bytes: &[u8]) -> Result<SoundMulProof, String> {
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound mul proof exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_NONNATIVE_PROOF_BYTES as u64);
+    let serializable: SerializableSoundMulProof =
+        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+    if serializable.d.len() != 64 {
+        return Err("invalid sound mul payload length".to_string());
+    }
+    let inner_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_NONNATIVE_PROOF_BYTES as u64);
+    let proof_inner: SoundAddSubStarkProof = inner_opts
+        .deserialize(&serializable.proof_bytes)
+        .map_err(|e| e.to_string())?;
+    let mut d = [0_u8; 64];
+    d.copy_from_slice(&serializable.d);
+    Ok(SoundMulProof {
+        proof: proof_inner,
+        settings: serializable.settings,
+        a: serializable.a,
+        b: serializable.b,
+        d,
+    })
+}
+
+pub fn serialize_sound_reduce_proof(proof: &SoundReduceProof) -> Result<Vec<u8>, String> {
+    let proof_bytes = bincode::serialize(&proof.proof).map_err(|e| e.to_string())?;
+    let serializable = SerializableSoundReduceProof {
+        proof_bytes,
+        settings: proof.settings,
+        d: proof.d.to_vec(),
+        q: proof.q,
+        r: proof.r,
+    };
+    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound reduce proof exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_sound_reduce_proof(bytes: &[u8]) -> Result<SoundReduceProof, String> {
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound reduce proof exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_NONNATIVE_PROOF_BYTES as u64);
+    let serializable: SerializableSoundReduceProof =
+        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+    if serializable.d.len() != 64 {
+        return Err("invalid sound reduce payload length".to_string());
+    }
+    let inner_opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_NONNATIVE_PROOF_BYTES as u64);
+    let proof_inner: SoundAddSubStarkProof = inner_opts
+        .deserialize(&serializable.proof_bytes)
+        .map_err(|e| e.to_string())?;
+    let mut d = [0_u8; 64];
+    d.copy_from_slice(&serializable.d);
+    Ok(SoundReduceProof {
+        proof: proof_inner,
+        settings: serializable.settings,
+        d,
+        q: serializable.q,
+        r: serializable.r,
+    })
+}
+
+pub fn serialize_sound_mul_mod_proof(proof: &SoundMulModProof) -> Result<Vec<u8>, String> {
+    let serializable = SerializableSoundMulModProof {
+        mul_bytes: serialize_sound_mul_proof(&proof.mul)?,
+        reduce_bytes: serialize_sound_reduce_proof(&proof.reduce)?,
+    };
+    let bytes = bincode::serialize(&serializable).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound mul-mod proof exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_sound_mul_mod_proof(bytes: &[u8]) -> Result<SoundMulModProof, String> {
+    if bytes.len() > MAX_SOUND_NONNATIVE_PROOF_BYTES {
+        return Err("serialized sound mul-mod proof exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_SOUND_NONNATIVE_PROOF_BYTES as u64);
+    let serializable: SerializableSoundMulModProof =
+        opts.deserialize(bytes).map_err(|e| e.to_string())?;
+    let mul = deserialize_sound_mul_proof(&serializable.mul_bytes)?;
+    let reduce = deserialize_sound_reduce_proof(&serializable.reduce_bytes)?;
+    Ok(SoundMulModProof { mul, reduce })
 }
 
 fn add_mod_p(a: [u8; 32], b: [u8; 32]) -> ([u8; 32], u8) {

@@ -11,7 +11,7 @@ const MODULUS_LIMBS: [u32; LIMBS] = [
     65535, 65535, 32767,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NonNativeFieldElement {
     pub limbs: [BabyBear; LIMBS],
 }
