@@ -4,6 +4,7 @@ pub mod affine;
 pub mod lookup;
 pub mod non_native;
 pub mod proof;
+pub mod sound_affine;
 pub mod trace;
 pub mod sound_nonnative;
 
@@ -38,5 +39,9 @@ pub use sound_nonnative::{
     verify_nonnative_sub_with_settings, verify_nonnative_mul, verify_nonnative_mul_mod_p,
     verify_nonnative_mul_mod_p_with_settings, verify_nonnative_mul_with_settings,
     verify_nonnative_reduce, verify_nonnative_reduce_with_settings,
+};
+pub use sound_affine::{
+    SoundAffineAddProof, prove_affine_add_sound, prove_affine_add_sound_with_settings,
+    verify_affine_add_sound, verify_affine_add_sound_with_settings,
 };
 pub use trace::{AffineMulTraceStep, build_affine_mul_trace, verify_affine_mul_trace};

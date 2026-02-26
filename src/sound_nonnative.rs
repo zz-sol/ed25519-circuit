@@ -26,6 +26,7 @@ const COL_B_BITS: usize = COL_A_BITS + (LIMBS * 8);
 const COL_C_BITS: usize = COL_B_BITS + (LIMBS * 8);
 const WIDTH: usize = COL_C_BITS + (LIMBS * 8);
 const TRACE_ROWS: usize = 256;
+const ADD_SUB_CARRY_BIAS: u8 = 2;
 
 const MODULUS_LE_BYTES: [u8; 32] = [
     0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -52,6 +53,7 @@ const RED_COL_R_BITS: usize = RED_COL_D_BITS + (64 * 8);
 const RED_COL_Q_BITS: usize = RED_COL_R_BITS + (32 * 8);
 const RED_COL_CARRY_BITS: usize = RED_COL_Q_BITS + (32 * 8);
 const RED_WIDTH: usize = RED_COL_CARRY_BITS + (65 * 24);
+const RED_CARRY_BIAS: u32 = 1 << 23;
 
 pub type Val = BabyBear;
 type ByteHash = Keccak256Hash;
@@ -112,15 +114,19 @@ where
         builder.assert_bool(q.clone());
         builder.assert_bool(is_sub.clone());
 
-        // carry_0 = 0, carry_32 = 0
-        builder.assert_zero(local[COL_CARRY].clone());
-        builder.assert_zero(local[COL_CARRY + LIMBS].clone());
+        // carry_0 = 0, carry_32 = 0 (biased encoding).
+        let carry_bias = Val::from_u8(ADD_SUB_CARRY_BIAS);
+        builder.assert_zero(local[COL_CARRY].clone() - carry_bias.clone());
+        builder.assert_zero(local[COL_CARRY + LIMBS].clone() - carry_bias.clone());
 
-        // carry_i in {0,1,2} for i=1..31
+        // actual carry_i in {-1,0,1,2} for i=1..31 => encoded in {1,2,3,4}.
         for i in 1..LIMBS {
             let c = local[COL_CARRY + i].clone();
             builder.assert_zero(
-                c.clone() * (c.clone() - AB::Expr::ONE) * (c.clone() - Val::from_u32(2)),
+                (c.clone() - Val::from_u32(1))
+                    * (c.clone() - Val::from_u32(2))
+                    * (c.clone() - Val::from_u32(3))
+                    * (c.clone() - Val::from_u32(4)),
             );
         }
 
@@ -148,8 +154,8 @@ where
             builder.assert_zero(b - b_recomposed);
             builder.assert_zero(c - c_recomposed);
 
-            let carry_i = local[COL_CARRY + i].clone();
-            let carry_next = local[COL_CARRY + i + 1].clone();
+            let carry_i = local[COL_CARRY + i].clone() - carry_bias.clone();
+            let carry_next = local[COL_CARRY + i + 1].clone() - carry_bias.clone();
             let p_i = Val::from_u8(MODULUS_LE_BYTES[i]);
 
             let e_add = local[COL_A + i].clone()
@@ -259,8 +265,9 @@ where
         let main = builder.main();
         let local = main.row_slice(0).expect("local row");
 
-        builder.assert_zero(local[RED_COL_CARRY].clone());
-        builder.assert_zero(local[RED_COL_CARRY + 64].clone());
+        let bias = Val::from_u32(RED_CARRY_BIAS);
+        builder.assert_zero(local[RED_COL_CARRY].clone() - bias.clone());
+        builder.assert_zero(local[RED_COL_CARRY + 64].clone() - bias.clone());
 
         for i in 0..64 {
             let mut d_rec = AB::Expr::ZERO;
@@ -310,13 +317,9 @@ where
             } else {
                 AB::Expr::ZERO
             };
-            builder.assert_zero(
-                local[RED_COL_D + i].clone()
-                    + local[RED_COL_CARRY + i].clone()
-                    - r_i
-                    - qxp
-                    - local[RED_COL_CARRY + i + 1].clone() * Val::from_u32(256),
-            );
+            let carry_i = local[RED_COL_CARRY + i].clone() - bias.clone();
+            let carry_next = local[RED_COL_CARRY + i + 1].clone() - bias.clone();
+            builder.assert_zero(local[RED_COL_D + i].clone() + carry_i - r_i - qxp - carry_next * Val::from_u32(256));
         }
     }
 }
@@ -440,18 +443,18 @@ fn sub_mod_p(a: [u8; 32], b: [u8; 32]) -> ([u8; 32], u8) {
     (out, 1)
 }
 
-fn carries_for_relation(a: [u8; 32], b: [u8; 32], c: [u8; 32], q: u8, is_sub: bool) -> [u8; 33] {
-    let mut carries = [0_u8; 33];
+fn carries_for_relation(a: [u8; 32], b: [u8; 32], c: [u8; 32], q: u8, is_sub: bool) -> [i8; 33] {
+    let mut carries = [0_i8; 33];
     for i in 0..32 {
         let lhs0 = if is_sub { c[i] } else { a[i] } as i32;
         let rhs0 = if is_sub { a[i] } else { c[i] } as i32;
         let tmp = lhs0 + (b[i] as i32) + (carries[i] as i32)
             - rhs0
             - (q as i32) * (MODULUS_LE_BYTES[i] as i32);
-        assert_eq!(tmp % 256, 0);
+        assert_eq!(tmp.rem_euclid(256), 0);
         let next = tmp / 256;
-        assert!((0..=2).contains(&next));
-        carries[i + 1] = next as u8;
+        assert!((-1..=2).contains(&next));
+        carries[i + 1] = next as i8;
     }
     assert_eq!(carries[32], 0);
     carries
@@ -463,14 +466,16 @@ fn build_trace(
     c: [u8; 32],
     q: u8,
     is_sub: bool,
-    carries: [u8; 33],
+    carries: [i8; 33],
 ) -> RowMajorMatrix<Val> {
     let mut row = vec![Val::ZERO; WIDTH];
     for i in 0..32 {
         row[COL_A + i] = Val::from_u8(a[i]);
         row[COL_B + i] = Val::from_u8(b[i]);
         row[COL_C + i] = Val::from_u8(c[i]);
-        row[COL_CARRY + i] = Val::from_u8(carries[i]);
+        let enc = (carries[i] as i16) + (ADD_SUB_CARRY_BIAS as i16);
+        assert!((1..=4).contains(&enc) || i == 0 || i == 32);
+        row[COL_CARRY + i] = Val::from_u8(enc as u8);
 
         for bit in 0..8 {
             row[COL_A_BITS + (i * 8) + bit] = Val::from_bool(((a[i] >> bit) & 1) == 1);
@@ -478,7 +483,7 @@ fn build_trace(
             row[COL_C_BITS + (i * 8) + bit] = Val::from_bool(((c[i] >> bit) & 1) == 1);
         }
     }
-    row[COL_CARRY + 32] = Val::from_u8(carries[32]);
+    row[COL_CARRY + 32] = Val::from_u8((carries[32] as i16 + ADD_SUB_CARRY_BIAS as i16) as u8);
     row[COL_Q] = Val::from_bool(q == 1);
     row[COL_IS_SUB] = Val::from_bool(is_sub);
 
@@ -553,8 +558,8 @@ fn divrem_mod_p_from_512(d: [u8; 64]) -> ([u8; 32], [u8; 32]) {
     (q_out, r_out)
 }
 
-fn carries_for_reduce(d: [u8; 64], q: [u8; 32], r: [u8; 32]) -> [u32; 65] {
-    let mut carries = [0_u32; 65];
+fn carries_for_reduce(d: [u8; 64], q: [u8; 32], r: [u8; 32]) -> [i32; 65] {
+    let mut carries = [0_i32; 65];
     for i in 0usize..64 {
         let mut qxp = 0_u32;
         let j_min = i.saturating_sub(31);
@@ -563,19 +568,16 @@ fn carries_for_reduce(d: [u8; 64], q: [u8; 32], r: [u8; 32]) -> [u32; 65] {
             let k = i - j;
             qxp += (q[j] as u32) * (MODULUS_LE_BYTES[k] as u32);
         }
-        let r_i = if i < 32 { r[i] as u32 } else { 0_u32 };
-        let lhs = (d[i] as u32) + carries[i];
-        let rhs_no_carry = r_i + qxp;
-        assert!(lhs >= rhs_no_carry);
-        let diff = lhs - rhs_no_carry;
-        assert_eq!(diff % 256, 0);
-        carries[i + 1] = diff / 256;
+        let r_i = if i < 32 { r[i] as i32 } else { 0_i32 };
+        let tmp = (d[i] as i32) + carries[i] - r_i - (qxp as i32);
+        assert_eq!(tmp.rem_euclid(256), 0);
+        carries[i + 1] = tmp / 256;
     }
     assert_eq!(carries[64], 0);
     carries
 }
 
-fn build_reduce_trace(d: [u8; 64], q: [u8; 32], r: [u8; 32], carries: [u32; 65]) -> RowMajorMatrix<Val> {
+fn build_reduce_trace(d: [u8; 64], q: [u8; 32], r: [u8; 32], carries: [i32; 65]) -> RowMajorMatrix<Val> {
     let mut row = vec![Val::ZERO; RED_WIDTH];
     for i in 0..64 {
         row[RED_COL_D + i] = Val::from_u8(d[i]);
@@ -592,10 +594,12 @@ fn build_reduce_trace(d: [u8; 64], q: [u8; 32], r: [u8; 32], carries: [u32; 65])
         }
     }
     for i in 0..65 {
-        row[RED_COL_CARRY + i] = Val::from_u32(carries[i]);
+        let enc = carries[i] + (RED_CARRY_BIAS as i32);
+        assert!((0..(1 << 24)).contains(&enc));
+        row[RED_COL_CARRY + i] = Val::from_u32(enc as u32);
         for bit in 0..24 {
             row[RED_COL_CARRY_BITS + (i * 24) + bit] =
-                Val::from_bool((((carries[i] >> bit) & 1) as u8) == 1);
+                Val::from_bool((((enc >> bit) & 1) as u8) == 1);
         }
     }
 
