@@ -30,6 +30,7 @@ pub use proof::{
     prove_affine_mul_sampled_sound_bundle_with_settings, prove_affine_mul_sound_with_settings,
     prove_affine_mul_with_settings, prove_basepoint_affine_mul, prove_basepoint_affine_mul_fully_sound,
     prove_basepoint_affine_mul_fully_sound_with_settings,
+    prove_basepoint_affine_mul_e2e_unified, prove_basepoint_affine_mul_e2e_unified_with_settings,
     prove_basepoint_affine_mul_sound,
     prove_basepoint_affine_mul_with_settings, recode_affine_mul_bundle_v2_instance,
     serialize_affine_mul_bundle, serialize_affine_mul_bundle_v2, serialize_affine_mul_e2e_blob, serialize_affine_mul_fully_sound_bundle,
@@ -50,6 +51,7 @@ pub use proof::{
     verify_affine_mul_sound, verify_affine_mul_sound_with_settings,
     verify_affine_mul_with_settings, verify_basepoint_affine_mul, verify_basepoint_affine_mul_fully_sound,
     verify_basepoint_affine_mul_fully_sound_with_settings,
+    verify_basepoint_affine_mul_e2e_unified, verify_basepoint_affine_mul_e2e_unified_with_settings,
     verify_basepoint_affine_mul_sound,
     verify_basepoint_affine_mul_with_settings,
 };

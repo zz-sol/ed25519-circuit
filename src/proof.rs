@@ -1447,6 +1447,28 @@ pub fn prove_affine_mul_e2e_unified_with_settings(
     serialize_affine_mul_e2e_blob(&blob)
 }
 
+pub fn prove_basepoint_affine_mul_e2e_unified(
+    scalar_le_bytes: [u8; 32],
+) -> Result<Vec<u8>, String> {
+    prove_affine_mul_e2e_unified(AffineMulInstance {
+        base: ed25519_basepoint_affine(),
+        scalar_le_bytes,
+    })
+}
+
+pub fn prove_basepoint_affine_mul_e2e_unified_with_settings(
+    scalar_le_bytes: [u8; 32],
+    arithmetic_settings: SoundAddSubProofSettings,
+) -> Result<Vec<u8>, String> {
+    prove_affine_mul_e2e_unified_with_settings(
+        AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes,
+        },
+        arithmetic_settings,
+    )
+}
+
 pub fn verify_affine_mul_e2e_unified(bytes: &[u8]) -> bool {
     let Ok(blob) = deserialize_affine_mul_e2e_blob(bytes) else {
         return false;
@@ -1461,6 +1483,39 @@ pub fn verify_affine_mul_e2e_unified_with_settings(
     let Ok(blob) = deserialize_affine_mul_e2e_blob(bytes) else {
         return false;
     };
+    verify_affine_mul_e2e_with_settings(&blob, arithmetic_settings)
+}
+
+pub fn verify_basepoint_affine_mul_e2e_unified(
+    scalar_le_bytes: [u8; 32],
+    bytes: &[u8],
+) -> bool {
+    let Ok(blob) = deserialize_affine_mul_e2e_blob(bytes) else {
+        return false;
+    };
+    let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
+        return false;
+    };
+    if instance.base != ed25519_basepoint_affine() || instance.scalar_le_bytes != scalar_le_bytes {
+        return false;
+    }
+    verify_affine_mul_e2e(&blob)
+}
+
+pub fn verify_basepoint_affine_mul_e2e_unified_with_settings(
+    scalar_le_bytes: [u8; 32],
+    bytes: &[u8],
+    arithmetic_settings: SoundAddSubProofSettings,
+) -> bool {
+    let Ok(blob) = deserialize_affine_mul_e2e_blob(bytes) else {
+        return false;
+    };
+    let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
+        return false;
+    };
+    if instance.base != ed25519_basepoint_affine() || instance.scalar_le_bytes != scalar_le_bytes {
+        return false;
+    }
     verify_affine_mul_e2e_with_settings(&blob, arithmetic_settings)
 }
 
@@ -2488,6 +2543,22 @@ mod tests {
         let mut bytes = serialize_affine_mul_e2e_blob(&blob).expect("encode");
         bytes[0] ^= 1;
         assert!(deserialize_affine_mul_e2e_blob(&bytes).is_err());
+    }
+
+    #[test]
+    fn verify_basepoint_e2e_unified_rejects_scalar_mismatch_fast() {
+        let scalar = scalar_from_u64(21);
+        let wrong = scalar_from_u64(22);
+        let instance = AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: scalar,
+        };
+        let blob = AffineMulE2eProofBlob {
+            sealed_instance: serialize_affine_mul_instance_compressed(&instance),
+            sealed_proof: Vec::new(),
+        };
+        let bytes = serialize_affine_mul_e2e_blob(&blob).expect("encode");
+        assert!(!verify_basepoint_affine_mul_e2e_unified(wrong, &bytes));
     }
 
     #[test]
