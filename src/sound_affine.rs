@@ -1,14 +1,14 @@
-use bincode::Options;
 use crate::affine::AffinePoint;
 use crate::non_native::NonNativeFieldElement;
 use crate::sound_nonnative::{
     SoundAddSubProof, SoundAddSubProofSettings, SoundMulModProof, deserialize_sound_add_sub_proof,
     deserialize_sound_mul_mod_proof, prove_nonnative_add_with_settings,
-    prove_nonnative_mul_mod_p_with_settings, prove_nonnative_sub_with_settings, serialize_sound_add_sub_proof,
-    serialize_sound_mul_mod_proof,
+    prove_nonnative_mul_mod_p_with_settings, prove_nonnative_sub_with_settings,
+    serialize_sound_add_sub_proof, serialize_sound_mul_mod_proof,
     verify_nonnative_add_with_settings, verify_nonnative_mul_mod_p_with_settings,
     verify_nonnative_sub_with_settings,
 };
+use bincode::Options;
 
 pub struct SoundAffineAddProof {
     pub settings: SoundAddSubProofSettings,
@@ -186,8 +186,7 @@ pub fn prove_affine_add_sound_with_settings(
     let y1y2 = prove_nonnative_mul_mod_p_with_settings(fe_bytes(lhs.y), fe_bytes(rhs.y), settings)?;
     let x1y2 = prove_nonnative_mul_mod_p_with_settings(fe_bytes(lhs.x), fe_bytes(rhs.y), settings)?;
     let y1x2 = prove_nonnative_mul_mod_p_with_settings(fe_bytes(lhs.y), fe_bytes(rhs.x), settings)?;
-    let d_mul_x1x2 =
-        prove_nonnative_mul_mod_p_with_settings(d_bytes(), x1x2.reduce.r, settings)?;
+    let d_mul_x1x2 = prove_nonnative_mul_mod_p_with_settings(d_bytes(), x1x2.reduce.r, settings)?;
     let dxxyy =
         prove_nonnative_mul_mod_p_with_settings(d_mul_x1x2.reduce.r, y1y2.reduce.r, settings)?;
 

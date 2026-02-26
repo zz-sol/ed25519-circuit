@@ -614,11 +614,11 @@ fn build_preprocessed_trace(
             values.push(Val::from_u32(limb));
         }
 
-        for i in 0..16 {
-            values.push(Val::from_u32(if is_last { final_x[i] } else { 0 }));
+        for &limb in &final_x {
+            values.push(Val::from_u32(if is_last { limb } else { 0 }));
         }
-        for i in 0..16 {
-            values.push(Val::from_u32(if is_last { final_y[i] } else { 0 }));
+        for &limb in &final_y {
+            values.push(Val::from_u32(if is_last { limb } else { 0 }));
         }
         values.push(deltas[row].0);
         values.push(deltas[row].1);
@@ -644,11 +644,11 @@ fn build_core_preprocessed_trace(
         let is_last = row + 1 == trace.len();
         values.push(Val::from_bool(is_last));
 
-        for i in 0..16 {
-            values.push(Val::from_u32(if is_last { final_x[i] } else { 0 }));
+        for &limb in &final_x {
+            values.push(Val::from_u32(if is_last { limb } else { 0 }));
         }
-        for i in 0..16 {
-            values.push(Val::from_u32(if is_last { final_y[i] } else { 0 }));
+        for &limb in &final_y {
+            values.push(Val::from_u32(if is_last { limb } else { 0 }));
         }
         values.push(deltas[row].0);
         values.push(deltas[row].1);
@@ -789,18 +789,30 @@ fn fully_sound_statement_hash(
     Ok(hasher.finalize().into())
 }
 
+#[allow(clippy::type_complexity)]
 fn build_full_arithmetic_chain(
     instance: AffineMulInstance,
     arithmetic_settings: SoundAddSubProofSettings,
-) -> Result<(Vec<usize>, Vec<SoundAffineAddProof>, Vec<SoundAffineAddProof>, [u8; 32]), String> {
+) -> Result<
+    (
+        Vec<usize>,
+        Vec<SoundAffineAddProof>,
+        Vec<SoundAffineAddProof>,
+        [u8; 32],
+    ),
+    String,
+> {
     let trace = build_affine_mul_trace(instance.base, instance.scalar_le_bytes);
     let sampled_rows = (0..trace.len()).collect::<Vec<_>>();
     let mut double_proofs = Vec::with_capacity(trace.len());
     let mut add_proofs = Vec::with_capacity(trace.len());
 
     for (row, step) in trace.iter().enumerate() {
-        let double_proof =
-            prove_affine_add_sound_with_settings(step.acc_before, step.acc_before, arithmetic_settings)?;
+        let double_proof = prove_affine_add_sound_with_settings(
+            step.acc_before,
+            step.acc_before,
+            arithmetic_settings,
+        )?;
         if double_proof.out != step.acc_after_double {
             return Err(format!("double proof output mismatch at row {row}"));
         }
@@ -1323,9 +1335,7 @@ pub fn serialize_affine_mul_sampled_sound_bundle(
     let payload = bincode::serialize(bundle).map_err(|e| e.to_string())?;
     let bytes = encode_with_tag(CODEC_TAG_SAMPLED_SOUND_BUNDLE, payload);
     if bytes.len() > 2 * MAX_SAMPLED_SOUND_PROOF_BYTES {
-        return Err(
-            "serialized sampled-sound bundle exceeds configured size limit".to_string(),
-        );
+        return Err("serialized sampled-sound bundle exceeds configured size limit".to_string());
     }
     Ok(bytes)
 }
@@ -1486,10 +1496,7 @@ pub fn verify_affine_mul_e2e_unified_with_settings(
     verify_affine_mul_e2e_with_settings(&blob, arithmetic_settings)
 }
 
-pub fn verify_basepoint_affine_mul_e2e_unified(
-    scalar_le_bytes: [u8; 32],
-    bytes: &[u8],
-) -> bool {
+pub fn verify_basepoint_affine_mul_e2e_unified(scalar_le_bytes: [u8; 32], bytes: &[u8]) -> bool {
     let Ok(blob) = deserialize_affine_mul_e2e_blob(bytes) else {
         return false;
     };
@@ -1972,7 +1979,8 @@ pub fn prove_affine_mul_sound_with_settings(
     if settings.sampled_rows > 256 {
         return Err("sampled_rows must be <= 256".to_string());
     }
-    if !meets_minimum_policy(settings.core) || !meets_minimum_arithmetic_policy(settings.arithmetic) {
+    if !meets_minimum_policy(settings.core) || !meets_minimum_arithmetic_policy(settings.arithmetic)
+    {
         return Err("sound proof settings do not meet minimum verifier policy".to_string());
     }
     let core = prove_affine_mul_core_with_settings(instance, settings.core)?;
@@ -2037,7 +2045,8 @@ pub fn verify_affine_mul_sound_with_settings(
     {
         return false;
     }
-    if !meets_minimum_policy(settings.core) || !meets_minimum_arithmetic_policy(settings.arithmetic) {
+    if !meets_minimum_policy(settings.core) || !meets_minimum_arithmetic_policy(settings.arithmetic)
+    {
         return false;
     }
     if !verify_affine_mul_core_with_settings(instance, &proof.core, settings.core) {
@@ -2120,8 +2129,12 @@ pub fn prove_affine_mul_fully_sound_strict_with_settings(
     }
     let (sampled_rows, double_proofs, add_proofs, output_compressed) =
         build_full_arithmetic_chain(instance, arithmetic_settings)?;
-    let statement_hash =
-        fully_sound_statement_hash(instance, arithmetic_settings, &sampled_rows, output_compressed)?;
+    let statement_hash = fully_sound_statement_hash(
+        instance,
+        arithmetic_settings,
+        &sampled_rows,
+        output_compressed,
+    )?;
     Ok(AffineMulFullySoundProof {
         arithmetic_settings,
         statement_hash,
@@ -2136,7 +2149,11 @@ pub fn verify_affine_mul_fully_sound(
     instance: AffineMulInstance,
     proof: &AffineMulFullySoundProof,
 ) -> bool {
-    verify_affine_mul_fully_sound_with_settings(instance, proof, SoundAddSubProofSettings::default())
+    verify_affine_mul_fully_sound_with_settings(
+        instance,
+        proof,
+        SoundAddSubProofSettings::default(),
+    )
 }
 
 pub fn verify_affine_mul_fully_sound_with_settings(
@@ -2462,8 +2479,8 @@ mod tests {
         };
         let mut settings = AffineMulSoundProofSettings::default();
         settings.core.rng_seed = 4242;
-        let bundle =
-            prove_affine_mul_sampled_sound_bundle_with_settings(instance, settings).expect("bundle");
+        let bundle = prove_affine_mul_sampled_sound_bundle_with_settings(instance, settings)
+            .expect("bundle");
         assert!(verify_affine_mul_sampled_sound_bundle_with_settings(
             &bundle, settings
         ));

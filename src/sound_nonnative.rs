@@ -30,9 +30,8 @@ const TRACE_ROWS: usize = 256;
 const ADD_SUB_CARRY_BIAS: u8 = 2;
 
 const MODULUS_LE_BYTES: [u8; 32] = [
-    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0x7f,
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
 ];
 
 const MUL_COL_A: usize = 0;
@@ -122,8 +121,8 @@ where
 
         // carry_0 = 0, carry_32 = 0 (biased encoding).
         let carry_bias = Val::from_u8(ADD_SUB_CARRY_BIAS);
-        builder.assert_zero(local[COL_CARRY].clone() - carry_bias.clone());
-        builder.assert_zero(local[COL_CARRY + LIMBS].clone() - carry_bias.clone());
+        builder.assert_zero(local[COL_CARRY].clone() - carry_bias);
+        builder.assert_zero(local[COL_CARRY + LIMBS].clone() - carry_bias);
 
         // actual carry_i in {-1,0,1,2} for i=1..31 => encoded in {1,2,3,4}.
         for i in 1..LIMBS {
@@ -160,19 +159,15 @@ where
             builder.assert_zero(b - b_recomposed);
             builder.assert_zero(c - c_recomposed);
 
-            let carry_i = local[COL_CARRY + i].clone() - carry_bias.clone();
-            let carry_next = local[COL_CARRY + i + 1].clone() - carry_bias.clone();
+            let carry_i = local[COL_CARRY + i].clone() - carry_bias;
+            let carry_next = local[COL_CARRY + i + 1].clone() - carry_bias;
             let p_i = Val::from_u8(MODULUS_LE_BYTES[i]);
 
-            let e_add = local[COL_A + i].clone()
-                + local[COL_B + i].clone()
-                + carry_i.clone()
+            let e_add = local[COL_A + i].clone() + local[COL_B + i].clone() + carry_i.clone()
                 - local[COL_C + i].clone()
                 - q.clone() * p_i
                 - carry_next.clone() * Val::from_u32(256);
-            let e_sub = local[COL_C + i].clone()
-                + local[COL_B + i].clone()
-                + carry_i
+            let e_sub = local[COL_C + i].clone() + local[COL_B + i].clone() + carry_i
                 - local[COL_A + i].clone()
                 - q.clone() * p_i
                 - carry_next * Val::from_u32(256);
@@ -272,8 +267,8 @@ where
         let local = main.row_slice(0).expect("local row");
 
         let bias = Val::from_u32(RED_CARRY_BIAS);
-        builder.assert_zero(local[RED_COL_CARRY].clone() - bias.clone());
-        builder.assert_zero(local[RED_COL_CARRY + 64].clone() - bias.clone());
+        builder.assert_zero(local[RED_COL_CARRY].clone() - bias);
+        builder.assert_zero(local[RED_COL_CARRY + 64].clone() - bias);
 
         for i in 0..64 {
             let mut d_rec = AB::Expr::ZERO;
@@ -323,9 +318,14 @@ where
             } else {
                 AB::Expr::ZERO
             };
-            let carry_i = local[RED_COL_CARRY + i].clone() - bias.clone();
-            let carry_next = local[RED_COL_CARRY + i + 1].clone() - bias.clone();
-            builder.assert_zero(local[RED_COL_D + i].clone() + carry_i - r_i - qxp - carry_next * Val::from_u32(256));
+            let carry_i = local[RED_COL_CARRY + i].clone() - bias;
+            let carry_next = local[RED_COL_CARRY + i + 1].clone() - bias;
+            builder.assert_zero(
+                local[RED_COL_D + i].clone() + carry_i
+                    - r_i
+                    - qxp
+                    - carry_next * Val::from_u32(256),
+            );
         }
     }
 }
@@ -801,6 +801,7 @@ fn divrem_mod_p_from_512(d: [u8; 64]) -> ([u8; 32], [u8; 32]) {
     (q_out, r_out)
 }
 
+#[allow(clippy::needless_range_loop)]
 fn carries_for_reduce(d: [u8; 64], q: [u8; 32], r: [u8; 32]) -> [i32; 65] {
     let mut carries = [0_i32; 65];
     for i in 0usize..64 {
@@ -820,7 +821,12 @@ fn carries_for_reduce(d: [u8; 64], q: [u8; 32], r: [u8; 32]) -> [i32; 65] {
     carries
 }
 
-fn build_reduce_trace(d: [u8; 64], q: [u8; 32], r: [u8; 32], carries: [i32; 65]) -> RowMajorMatrix<Val> {
+fn build_reduce_trace(
+    d: [u8; 64],
+    q: [u8; 32],
+    r: [u8; 32],
+    carries: [i32; 65],
+) -> RowMajorMatrix<Val> {
     let mut row = vec![Val::ZERO; RED_WIDTH];
     for i in 0..64 {
         row[RED_COL_D + i] = Val::from_u8(d[i]);
@@ -1178,8 +1184,8 @@ mod tests {
         let proof = prove_nonnative_mul_mod_p(a, b).expect("prove");
         assert!(verify_nonnative_mul_mod_p(&proof));
 
-        let expected =
-            (BigUint::from_bytes_le(&a) * BigUint::from_bytes_le(&b)) % BigUint::from_bytes_le(&MODULUS_LE_BYTES);
+        let expected = (BigUint::from_bytes_le(&a) * BigUint::from_bytes_le(&b))
+            % BigUint::from_bytes_le(&MODULUS_LE_BYTES);
         let mut expected_r = expected.to_bytes_le();
         expected_r.resize(32, 0);
         assert_eq!(proof.reduce.r[..], expected_r[..32]);

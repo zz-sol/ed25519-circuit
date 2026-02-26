@@ -58,12 +58,14 @@ impl NonNativeFieldElement {
         out
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, rhs: Self) -> Self {
         let p = modulus();
         let out = (self.to_biguint() + rhs.to_biguint()) % &p;
         Self::from_biguint(out)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, rhs: Self) -> Self {
         let a = self.to_biguint();
         let b = rhs.to_biguint();
@@ -75,10 +77,12 @@ impl NonNativeFieldElement {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn neg(self) -> Self {
         Self::zero().sub(self)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, rhs: Self) -> Self {
         let p = modulus();
         let out = (self.to_biguint() * rhs.to_biguint()) % &p;

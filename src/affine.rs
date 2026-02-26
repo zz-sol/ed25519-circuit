@@ -66,6 +66,7 @@ impl AffinePoint {
         lhs == rhs
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, rhs: Self) -> Self {
         self.add_with_witness(rhs).out
     }
@@ -143,7 +144,7 @@ impl AffinePoint {
 
         let mut x = sqrt_mod_p(x2.to_biguint())?;
         let parity = x.clone() & BigUint::one();
-        let want = BigUint::from(x_sign as u8);
+        let want = BigUint::from(x_sign);
         if x.is_zero() {
             // Canonical encoding requires sign bit 0 when x == 0.
             if x_sign == 1 {
