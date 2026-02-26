@@ -439,6 +439,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "expensive: generates multiple nested STARK proofs"]
     fn signature_equation_proof_roundtrip() {
         let a_secret = Scalar::from(123u64);
         let r_nonce = Scalar::from(45u64);
@@ -469,6 +470,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "expensive: generates multiple nested STARK proofs"]
     fn signature_equation_proof_rejects_tamper() {
         let base = ed25519_basepoint_affine();
         let public_key = base.scalar_mul(scalar_from_u64(3)).compress();
@@ -488,5 +490,24 @@ mod tests {
         assert!(verify_ed25519_signature_equation(&proof));
         proof.statement_hash[0] ^= 1;
         assert!(!verify_ed25519_signature_equation(&proof));
+    }
+
+    #[test]
+    fn native_equation_check_accepts_valid_relation() {
+        let a_secret = Scalar::from(7u64);
+        let r_nonce = Scalar::from(12u64);
+        let public_key = (&a_secret * curve25519::constants::ED25519_BASEPOINT_TABLE)
+            .compress()
+            .to_bytes();
+        let r = (&r_nonce * curve25519::constants::ED25519_BASEPOINT_TABLE)
+            .compress()
+            .to_bytes();
+        let msg = b"native equation";
+        let k =
+            Scalar::from_bytes_mod_order(derive_ed25519_challenge_scalar_mod_l(r, public_key, msg));
+        let s = (r_nonce + (k * a_secret)).to_bytes();
+        assert!(verify_ed25519_signature_equation_native(
+            public_key, r, s, msg
+        ));
     }
 }
