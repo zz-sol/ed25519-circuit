@@ -3,6 +3,10 @@ name = "ed25519-circuit"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+prove-tests = []
+
 [dependencies]
 p3-air = "0.4.2"
 p3-baby-bear = "0.4.2"

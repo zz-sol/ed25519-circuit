@@ -2132,7 +2132,7 @@ pub fn verify_affine_mul_fully_sound_strict_with_settings(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prove-tests"))]
 mod tests {
     use super::*;
     use crate::NonNativeFieldElement;

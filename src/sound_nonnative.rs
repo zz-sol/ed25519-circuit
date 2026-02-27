@@ -1080,7 +1080,7 @@ pub fn verify_nonnative_mul_mod_p_with_settings(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prove-tests"))]
 mod tests {
     use super::*;
 

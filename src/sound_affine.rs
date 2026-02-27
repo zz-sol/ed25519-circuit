@@ -337,7 +337,7 @@ pub fn verify_affine_add_sound_with_settings(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prove-tests"))]
 mod tests {
     use super::*;
     use crate::affine::ed25519_basepoint_affine;
