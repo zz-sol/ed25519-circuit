@@ -1,434 +1,176 @@
-use crate::non_native::NonNativeFieldElement;
 use num_bigint::BigUint;
-use num_traits::{One, Zero};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+use crate::non_native_field::Ed25519BaseField;
+use crate::non_native_field::sound::{SoundFieldChip, SoundFieldError};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AffinePoint {
-    pub x: NonNativeFieldElement,
-    pub y: NonNativeFieldElement,
+    pub x: Ed25519BaseField,
+    pub y: Ed25519BaseField,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AffineAddWitness {
-    pub lhs: AffinePoint,
-    pub rhs: AffinePoint,
-    pub x1x2: NonNativeFieldElement,
-    pub y1y2: NonNativeFieldElement,
-    pub x1y2: NonNativeFieldElement,
-    pub y1x2: NonNativeFieldElement,
-    pub dxxyy: NonNativeFieldElement,
-    pub x_num: NonNativeFieldElement,
-    pub y_num: NonNativeFieldElement,
-    pub x_den: NonNativeFieldElement,
-    pub y_den: NonNativeFieldElement,
-    pub x_den_inv: NonNativeFieldElement,
-    pub y_den_inv: NonNativeFieldElement,
-    pub out: AffinePoint,
-}
-
-const D_LIMBS: [u32; 16] = [
-    30883, 4953, 19914, 30187, 55467, 16705, 2637, 112, 59544, 30585, 16505, 36039, 65139, 11119,
-    27886, 20995,
-];
-
-const BASE_X_LIMBS: [u32; 16] = [
-    54554, 36645, 11616, 51542, 42930, 38181, 51040, 26924, 56412, 64982, 57905, 49316, 21502,
-    52590, 14035, 8553,
-];
-
-const BASE_Y_LIMBS: [u32; 16] = [
-    26200, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214,
-    26214, 26214, 26214,
-];
-
-const SUBGROUP_ORDER_LE_BYTES: [u8; 32] = [
-    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
-];
 
 impl AffinePoint {
     pub fn identity() -> Self {
         Self {
-            x: NonNativeFieldElement::zero(),
-            y: NonNativeFieldElement::one(),
+            x: Ed25519BaseField::zero(),
+            y: Ed25519BaseField::one(),
         }
     }
 
-    pub fn d() -> NonNativeFieldElement {
-        NonNativeFieldElement::from_limbs_u32(D_LIMBS)
+    pub fn basepoint() -> Self {
+        Self {
+            x: Ed25519BaseField::from_biguint(decimal_biguint(
+                "15112221349535400772501151409588531511454012693041857206046113283949847762202",
+            )),
+            y: Ed25519BaseField::from_biguint(decimal_biguint(
+                "46316835694926478169428394003475163141307993866256225615783033603165251855960",
+            )),
+        }
     }
 
-    pub fn is_on_curve(self) -> bool {
-        let x2 = self.x.square();
-        let y2 = self.y.square();
-        let lhs = y2.sub(x2);
-        let rhs = NonNativeFieldElement::one().add(Self::d().mul(x2).mul(y2));
+    pub fn is_on_curve(&self) -> bool {
+        // For ed25519 twisted Edwards: -x^2 + y^2 = 1 + d*x^2*y^2
+        let x2 = self.x.square_mod();
+        let y2 = self.y.square_mod();
+        let lhs = y2.sub_mod(&x2);
+
+        let d = curve_d();
+        let rhs = Ed25519BaseField::one().add_mod(&d.mul_mod(&x2.mul_mod(&y2)));
         lhs == rhs
     }
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn add(self, rhs: Self) -> Self {
-        self.add_with_witness(rhs).out
+    pub fn add(&self, rhs: &Self, chip: &mut SoundFieldChip) -> Result<Self, SoundFieldError> {
+        // Affine formulas for a = -1 twisted Edwards curve.
+        let x1y2 = chip.mul(&self.x, &rhs.y)?;
+        let y1x2 = chip.mul(&self.y, &rhs.x)?;
+        let y1y2 = chip.mul(&self.y, &rhs.y)?;
+        let x1x2 = chip.mul(&self.x, &rhs.x)?;
+
+        let x_num = chip.add(&x1y2, &y1x2)?;
+        // y numerator uses -a*x1*x2, and ed25519 has a = -1.
+        let y_num = chip.add(&y1y2, &x1x2)?;
+
+        let d = curve_d();
+        let xxyy = chip.mul(&x1x2, &y1y2)?;
+        let dxxyy = chip.mul(&d, &xxyy)?;
+
+        let x_den = chip.add(&Ed25519BaseField::one(), &dxxyy)?;
+        let y_den = chip.sub(&Ed25519BaseField::one(), &dxxyy)?;
+
+        let x_den_inv = chip.inv(&x_den)?;
+        let y_den_inv = chip.inv(&y_den)?;
+
+        let x3 = chip.mul(&x_num, &x_den_inv)?;
+        let y3 = chip.mul(&y_num, &y_den_inv)?;
+
+        Ok(Self { x: x3, y: y3 })
     }
 
-    pub fn add_with_witness(self, rhs: Self) -> AffineAddWitness {
-        let x1x2 = self.x.mul(rhs.x);
-        let y1y2 = self.y.mul(rhs.y);
-        let x1y2 = self.x.mul(rhs.y);
-        let y1x2 = self.y.mul(rhs.x);
-        let dxxyy = Self::d().mul(x1x2).mul(y1y2);
-
-        let one = NonNativeFieldElement::one();
-        let x_num = x1y2.add(y1x2);
-        let y_num = y1y2.add(x1x2);
-        let x_den = one.add(dxxyy);
-        let y_den = one.sub(dxxyy);
-        let x_den_inv = x_den.inv();
-        let y_den_inv = y_den.inv();
-
-        let x3 = x_num.mul(x_den_inv);
-        let y3 = y_num.mul(y_den_inv);
-        AffineAddWitness {
-            lhs: self,
-            rhs,
-            x1x2,
-            y1y2,
-            x1y2,
-            y1x2,
-            dxxyy,
-            x_num,
-            y_num,
-            x_den,
-            y_den,
-            x_den_inv,
-            y_den_inv,
-            out: Self { x: x3, y: y3 },
-        }
+    pub fn double(&self, chip: &mut SoundFieldChip) -> Result<Self, SoundFieldError> {
+        self.add(self, chip)
     }
 
-    pub fn double(self) -> Self {
-        self.add(self)
-    }
-
-    pub fn scalar_mul(self, scalar_le_bytes: [u8; 32]) -> Self {
+    pub fn scalar_mul_le(
+        &self,
+        scalar_le: [u8; 32],
+        chip: &mut SoundFieldChip,
+    ) -> Result<Self, SoundFieldError> {
         let mut acc = Self::identity();
-        for i in (0..256).rev() {
-            acc = acc.double();
-            let bit = (scalar_le_bytes[i / 8] >> (i % 8)) & 1;
-            if bit == 1 {
-                acc = acc.add(self);
+        let mut cur = self.clone();
+
+        for byte in scalar_le {
+            for bit in 0..8 {
+                if ((byte >> bit) & 1) == 1 {
+                    acc = acc.add(&cur, chip)?;
+                }
+                cur = cur.double(chip)?;
             }
         }
-        acc
+
+        Ok(acc)
     }
 
-    pub fn compress(self) -> [u8; 32] {
-        let mut bytes = self.y.to_ed25519_le_bytes();
-        let x_is_odd = (self.x.limbs_u32()[0] & 1) == 1;
-        if x_is_odd {
-            bytes[31] |= 0x80;
-        }
-        bytes
-    }
-
-    fn from_compressed_bytes_inner(
-        mut bytes: [u8; 32],
-        canonical_y: bool,
-        require_prime_subgroup: bool,
-        require_zero_sign_for_x_zero: bool,
-    ) -> Option<Self> {
-        let x_sign = (bytes[31] >> 7) & 1;
-        bytes[31] &= 0x7f;
-        let y = if canonical_y {
-            NonNativeFieldElement::from_ed25519_le_bytes_strict(bytes)?
+    pub fn compress(&self) -> [u8; 32] {
+        let mut out = self.y.to_bytes_le();
+        let sign = (self.x.to_biguint() & BigUint::from(1u32)) == BigUint::from(1u32);
+        if sign {
+            out[31] |= 0x80;
         } else {
-            NonNativeFieldElement::from_ed25519_le_bytes(bytes)
-        };
-
-        let one = NonNativeFieldElement::one();
-        let y2 = y.square();
-        let u = y2.sub(one);
-        let v = Self::d().mul(y2).add(one);
-        let x2 = u.mul(v.inv());
-
-        let mut x = sqrt_mod_p(x2.to_biguint())?;
-        let parity = x.clone() & BigUint::one();
-        let want = BigUint::from(x_sign);
-        if x.is_zero() {
-            if require_zero_sign_for_x_zero && x_sign == 1 {
-                return None;
-            }
-        } else if parity != want {
-            x = ed25519_modulus() - x;
+            out[31] &= 0x7f;
         }
-
-        let p = Self {
-            x: NonNativeFieldElement::from_biguint(x),
-            y,
-        };
-        if !p.is_on_curve() {
-            return None;
-        }
-        if require_prime_subgroup && !p.is_in_prime_order_subgroup() {
-            return None;
-        }
-        Some(p)
-    }
-
-    pub fn from_compressed_bytes_strict(bytes: [u8; 32]) -> Option<Self> {
-        Self::from_compressed_bytes_inner(bytes, true, true, true)
-    }
-
-    pub fn from_compressed_bytes_relaxed(bytes: [u8; 32]) -> Option<Self> {
-        Self::from_compressed_bytes_inner(bytes, false, false, false)
-    }
-
-    pub fn is_in_prime_order_subgroup(self) -> bool {
-        self.scalar_mul(SUBGROUP_ORDER_LE_BYTES) == Self::identity()
-    }
-
-    pub fn to_uncompressed_bytes(self) -> [u8; 64] {
-        let mut out = [0_u8; 64];
-        out[..32].copy_from_slice(&self.x.to_ed25519_le_bytes());
-        out[32..].copy_from_slice(&self.y.to_ed25519_le_bytes());
         out
     }
-
-    pub fn from_uncompressed_bytes_strict(bytes: [u8; 64]) -> Option<Self> {
-        let mut x_bytes = [0_u8; 32];
-        let mut y_bytes = [0_u8; 32];
-        x_bytes.copy_from_slice(&bytes[..32]);
-        y_bytes.copy_from_slice(&bytes[32..]);
-        let x = NonNativeFieldElement::from_ed25519_le_bytes_strict(x_bytes)?;
-        let y = NonNativeFieldElement::from_ed25519_le_bytes_strict(y_bytes)?;
-        let p = Self { x, y };
-        if !p.is_on_curve() || !p.is_in_prime_order_subgroup() {
-            return None;
-        }
-        Some(p)
-    }
 }
 
-impl AffineAddWitness {
-    pub fn verify(self) -> bool {
-        if !self.lhs.is_on_curve() || !self.rhs.is_on_curve() || !self.out.is_on_curve() {
-            return false;
-        }
-        let d = AffinePoint::d();
-        let one = NonNativeFieldElement::one();
-
-        if self.x1x2 != self.lhs.x.mul(self.rhs.x) {
-            return false;
-        }
-        if self.y1y2 != self.lhs.y.mul(self.rhs.y) {
-            return false;
-        }
-        if self.x1y2 != self.lhs.x.mul(self.rhs.y) {
-            return false;
-        }
-        if self.y1x2 != self.lhs.y.mul(self.rhs.x) {
-            return false;
-        }
-        if self.dxxyy != d.mul(self.x1x2).mul(self.y1y2) {
-            return false;
-        }
-        if self.x_num != self.x1y2.add(self.y1x2) {
-            return false;
-        }
-        if self.y_num != self.y1y2.add(self.x1x2) {
-            return false;
-        }
-        if self.x_den != one.add(self.dxxyy) {
-            return false;
-        }
-        if self.y_den != one.sub(self.dxxyy) {
-            return false;
-        }
-        if self.x_den.mul(self.x_den_inv) != one {
-            return false;
-        }
-        if self.y_den.mul(self.y_den_inv) != one {
-            return false;
-        }
-        if self.out.x != self.x_num.mul(self.x_den_inv) {
-            return false;
-        }
-        if self.out.y != self.y_num.mul(self.y_den_inv) {
-            return false;
-        }
-        true
-    }
+fn curve_d() -> Ed25519BaseField {
+    // d = -121665 / 121666 mod p
+    let minus_121665 = Ed25519BaseField::from_u64(121665).neg_mod();
+    let inv_121666 = Ed25519BaseField::from_u64(121666)
+        .inv_mod()
+        .expect("121666 must be invertible in ed25519 base field");
+    minus_121665.mul_mod(&inv_121666)
 }
 
-pub fn ed25519_basepoint_affine() -> AffinePoint {
-    AffinePoint {
-        x: NonNativeFieldElement::from_limbs_u32(BASE_X_LIMBS),
-        y: NonNativeFieldElement::from_limbs_u32(BASE_Y_LIMBS),
-    }
-}
-
-fn ed25519_modulus() -> BigUint {
-    (BigUint::one() << 255) - BigUint::from(19_u32)
-}
-
-fn sqrt_mod_p(n: BigUint) -> Option<BigUint> {
-    let p = ed25519_modulus();
-    if n >= p {
-        return None;
-    }
-    if n == BigUint::zero() {
-        return Some(n);
-    }
-    let exp = (&p + BigUint::from(3_u8)) >> 3;
-    let mut x = n.modpow(&exp, &p);
-    if (&x * &x) % &p != n {
-        let i = BigUint::from(2_u8).modpow(&((&p - BigUint::one()) >> 2), &p);
-        x = (&x * i) % &p;
-        if (&x * &x) % &p != n {
-            return None;
-        }
-    }
-    Some(x)
+fn decimal_biguint(decimal: &str) -> BigUint {
+    BigUint::parse_bytes(decimal.as_bytes(), 10).expect("invalid decimal constant")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use curve25519::constants::ED25519_BASEPOINT_TABLE;
-    use curve25519::edwards::CompressedEdwardsY;
-    use curve25519::scalar::Scalar;
+    use super::AffinePoint;
+    use crate::non_native_field::sound::SoundFieldChip;
+    use curve25519::{Scalar, constants::ED25519_BASEPOINT_POINT};
+    use rand::{RngCore, SeedableRng, rngs::SmallRng};
 
     #[test]
     fn basepoint_is_on_curve() {
-        assert!(ed25519_basepoint_affine().is_on_curve());
+        assert!(AffinePoint::basepoint().is_on_curve());
     }
 
     #[test]
-    fn scalar_mul_matches_curve25519_sol_basepoint() {
-        let base = ed25519_basepoint_affine();
-        let samples = [
-            [0_u8; 32],
-            [1_u8; 32],
-            [2_u8; 32],
-            [7_u8; 32],
-            [42_u8; 32],
-            [255_u8; 32],
-        ];
-        for scalar_bytes in samples {
-            let ours = base.scalar_mul(scalar_bytes).compress();
-            let scalar = Scalar::from_bytes_mod_order(scalar_bytes);
-            let expected = (&scalar * ED25519_BASEPOINT_TABLE).compress().to_bytes();
-            assert_eq!(ours, expected);
+    fn randomized_scalar_mul_matches_reference() {
+        let mut rng = SmallRng::seed_from_u64(0x1234_5678_9abc_def0);
+
+        for _ in 0..40 {
+            let mut k_bytes = [0u8; 32];
+            rng.fill_bytes(&mut k_bytes);
+
+            let mut chip = SoundFieldChip::default();
+            let ours = AffinePoint::basepoint()
+                .scalar_mul_le(k_bytes, &mut chip)
+                .unwrap();
+
+            let k = Scalar::from_bytes_mod_order(k_bytes);
+            let reference = (ED25519_BASEPOINT_POINT * k).compress().to_bytes();
+
+            assert_eq!(ours.compress(), reference);
         }
     }
 
     #[test]
-    fn add_witness_roundtrip() {
-        let p = ed25519_basepoint_affine();
-        let q = p.double();
-        let w = p.add_with_witness(q);
-        assert!(w.verify());
-        assert_eq!(w.out, p.add(q));
-    }
+    fn randomized_group_add_matches_reference() {
+        let mut rng = SmallRng::seed_from_u64(0xfeed_beef_cafe_f00d);
 
-    #[test]
-    fn add_witness_rejects_tamper() {
-        let p = ed25519_basepoint_affine();
-        let q = p.double();
-        let mut w = p.add_with_witness(q);
-        w.x_num = w.x_num.add(NonNativeFieldElement::one());
-        assert!(!w.verify());
-    }
+        for _ in 0..30 {
+            let mut a_bytes = [0u8; 32];
+            let mut b_bytes = [0u8; 32];
+            rng.fill_bytes(&mut a_bytes);
+            rng.fill_bytes(&mut b_bytes);
 
-    #[test]
-    fn subgroup_check_accepts_basepoint() {
-        let p = ed25519_basepoint_affine();
-        assert!(p.is_in_prime_order_subgroup());
-    }
+            let mut chip = SoundFieldChip::default();
+            let g = AffinePoint::basepoint();
+            let pa = g.scalar_mul_le(a_bytes, &mut chip).unwrap();
+            let pb = g.scalar_mul_le(b_bytes, &mut chip).unwrap();
+            let sum = pa.add(&pb, &mut chip).unwrap();
 
-    #[test]
-    fn subgroup_check_rejects_low_order_point() {
-        let minus_one = NonNativeFieldElement::from_ed25519_le_bytes([
-            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0x7f,
-        ]);
-        let torsion2 = AffinePoint {
-            x: NonNativeFieldElement::zero(),
-            y: minus_one,
-        };
-        assert!(torsion2.is_on_curve());
-        assert!(!torsion2.is_in_prime_order_subgroup());
-    }
+            let a = Scalar::from_bytes_mod_order(a_bytes);
+            let b = Scalar::from_bytes_mod_order(b_bytes);
+            let reference = (ED25519_BASEPOINT_POINT * a + ED25519_BASEPOINT_POINT * b)
+                .compress()
+                .to_bytes();
 
-    #[test]
-    fn strict_uncompressed_point_roundtrip() {
-        let p = ed25519_basepoint_affine().scalar_mul([9_u8; 32]);
-        let bytes = p.to_uncompressed_bytes();
-        let decoded = AffinePoint::from_uncompressed_bytes_strict(bytes).expect("decode");
-        assert_eq!(decoded, p);
-    }
-
-    #[test]
-    fn strict_uncompressed_point_rejects_low_order() {
-        let minus_one = NonNativeFieldElement::from_ed25519_le_bytes([
-            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0x7f,
-        ]);
-        let torsion2 = AffinePoint {
-            x: NonNativeFieldElement::zero(),
-            y: minus_one,
-        };
-        let bytes = torsion2.to_uncompressed_bytes();
-        assert!(AffinePoint::from_uncompressed_bytes_strict(bytes).is_none());
-    }
-
-    #[test]
-    fn compressed_point_roundtrip() {
-        let p = ed25519_basepoint_affine().scalar_mul([17_u8; 32]);
-        let enc = p.compress();
-        let dec = AffinePoint::from_compressed_bytes_strict(enc).expect("decode");
-        assert_eq!(dec, p);
-    }
-
-    #[test]
-    fn compressed_point_rejects_non_canonical_y() {
-        let enc = [
-            0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0x7f,
-        ];
-        assert!(AffinePoint::from_compressed_bytes_strict(enc).is_none());
-    }
-
-    #[test]
-    fn compressed_point_rejects_x_zero_with_sign_bit_set() {
-        // Identity encodes as y=1 with sign bit 0; sign bit 1 is non-canonical.
-        let mut enc = [0_u8; 32];
-        enc[0] = 1;
-        enc[31] |= 0x80;
-        assert!(AffinePoint::from_compressed_bytes_strict(enc).is_none());
-    }
-
-    #[test]
-    fn compressed_decode_matches_curve25519_sol_for_samples() {
-        let base = ed25519_basepoint_affine();
-        let samples = [
-            [1_u8; 32],
-            [2_u8; 32],
-            [7_u8; 32],
-            [42_u8; 32],
-            [200_u8; 32],
-        ];
-        for scalar_bytes in samples {
-            let p = base.scalar_mul(scalar_bytes);
-            let enc = p.compress();
-            let ours = AffinePoint::from_compressed_bytes_strict(enc).expect("ours decode");
-            let theirs = CompressedEdwardsY(enc)
-                .decompress()
-                .expect("curve25519 decode");
-            assert_eq!(ours.compress(), theirs.compress().to_bytes());
+            assert_eq!(sum.compress(), reference);
+            assert!(sum.is_on_curve());
         }
     }
 }
