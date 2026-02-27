@@ -7,8 +7,6 @@ use crate::sound_affine::{
 use crate::sound_nonnative::SoundAddSubProofSettings;
 use crate::trace::{build_affine_mul_trace, scalar_bit_le, verify_affine_mul_trace};
 use bincode::Options;
-use curve25519::edwards::CompressedEdwardsY;
-use curve25519::scalar::Scalar;
 use p3_air::{Air, AirBuilder, BaseAir, PairBuilder};
 use p3_baby_bear::BabyBear;
 use p3_challenger::{HashChallenger, SerializingChallenger32};
@@ -703,12 +701,6 @@ fn statement_hash(
     Ok(hasher.finalize().into())
 }
 
-fn reference_scalar_mul_output(instance: AffineMulInstance) -> Option<[u8; 32]> {
-    let base = CompressedEdwardsY(instance.base.compress()).decompress()?;
-    let scalar = Scalar::from_bytes_mod_order(instance.scalar_le_bytes);
-    Some((scalar * base).compress().to_bytes())
-}
-
 fn sample_rows_evenly(total_rows: usize, sample_count: usize) -> Vec<usize> {
     if total_rows == 0 || sample_count == 0 {
         return Vec::new();
@@ -753,17 +745,6 @@ fn meets_minimum_arithmetic_policy(settings: SoundAddSubProofSettings) -> bool {
         && settings.num_queries >= 2
         && settings.commit_proof_of_work_bits >= 1
         && settings.query_proof_of_work_bits >= 1
-}
-
-fn core_settings_from_arithmetic(settings: SoundAddSubProofSettings) -> AffineMulProofSettings {
-    AffineMulProofSettings {
-        log_blowup: settings.log_blowup,
-        log_final_poly_len: settings.log_final_poly_len,
-        num_queries: settings.num_queries,
-        commit_proof_of_work_bits: settings.commit_proof_of_work_bits,
-        query_proof_of_work_bits: settings.query_proof_of_work_bits,
-        rng_seed: settings.rng_seed,
-    }
 }
 
 fn sampled_sound_statement_hash(
@@ -1493,10 +1474,10 @@ pub fn verify_basepoint_affine_mul_single_unified_with_settings(
 }
 
 pub fn prove_affine_mul_e2e(instance: AffineMulInstance) -> Result<AffineMulE2eProofBlob, String> {
-    let blob = prove_affine_mul_single_proof(instance)?;
+    let bundle = prove_affine_mul_fully_sound_bundle(instance)?;
     Ok(AffineMulE2eProofBlob {
-        sealed_instance: blob.sealed_instance,
-        sealed_proof: blob.sealed_proof,
+        sealed_instance: bundle.sealed_instance,
+        sealed_proof: bundle.sealed_proof,
     })
 }
 
@@ -1504,11 +1485,10 @@ pub fn prove_affine_mul_e2e_with_settings(
     instance: AffineMulInstance,
     arithmetic_settings: SoundAddSubProofSettings,
 ) -> Result<AffineMulE2eProofBlob, String> {
-    let core_settings = core_settings_from_arithmetic(arithmetic_settings);
-    let blob = prove_affine_mul_single_proof_with_settings(instance, core_settings)?;
+    let bundle = prove_affine_mul_fully_sound_bundle_with_settings(instance, arithmetic_settings)?;
     Ok(AffineMulE2eProofBlob {
-        sealed_instance: blob.sealed_instance,
-        sealed_proof: blob.sealed_proof,
+        sealed_instance: bundle.sealed_instance,
+        sealed_proof: bundle.sealed_proof,
     })
 }
 
@@ -1516,10 +1496,14 @@ pub fn verify_affine_mul_e2e(blob: &AffineMulE2eProofBlob) -> bool {
     let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
         return false;
     };
-    let Ok(proof) = deserialize_affine_mul_proof(&blob.sealed_proof) else {
+    let Ok(proof) = deserialize_affine_mul_fully_sound_proof(&blob.sealed_proof) else {
         return false;
     };
-    verify_affine_mul_core_with_settings(instance, &proof, AffineMulProofSettings::default())
+    verify_affine_mul_fully_sound_strict_with_settings(
+        instance,
+        &proof,
+        SoundAddSubProofSettings::default(),
+    )
 }
 
 pub fn verify_affine_mul_e2e_with_settings(
@@ -1529,11 +1513,10 @@ pub fn verify_affine_mul_e2e_with_settings(
     let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
         return false;
     };
-    let Ok(proof) = deserialize_affine_mul_proof(&blob.sealed_proof) else {
+    let Ok(proof) = deserialize_affine_mul_fully_sound_proof(&blob.sealed_proof) else {
         return false;
     };
-    let core_settings = core_settings_from_arithmetic(arithmetic_settings);
-    verify_affine_mul_core_with_settings(instance, &proof, core_settings)
+    verify_affine_mul_fully_sound_strict_with_settings(instance, &proof, arithmetic_settings)
 }
 
 pub fn serialize_affine_mul_e2e_blob(blob: &AffineMulE2eProofBlob) -> Result<Vec<u8>, String> {
@@ -1776,12 +1759,6 @@ pub fn prove_affine_mul_with_settings(
         .ok_or_else(|| "trace is empty".to_string())?
         .acc_after_select;
     let output_compressed = final_point.compress();
-    let reference_output = reference_scalar_mul_output(instance)
-        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
-    if output_compressed != reference_output {
-        return Err("output does not match reference scalar multiplication".to_string());
-    }
-
     let main = build_main_trace(&trace, &deltas);
     let preprocessed =
         build_preprocessed_trace(instance.scalar_le_bytes, &trace, final_point, &deltas);
@@ -1856,10 +1833,16 @@ pub fn verify_affine_mul_with_settings(
     if final_point.compress() != proof.output_compressed {
         return false;
     }
-    let Some(reference_output) = reference_scalar_mul_output(instance) else {
-        return false;
+    let expected_hash = match statement_hash(
+        instance,
+        proof.output_compressed,
+        settings,
+        &proof.preprocessed_vk,
+    ) {
+        Ok(h) => h,
+        Err(_) => return false,
     };
-    if reference_output != proof.output_compressed {
+    if proof.statement_hash != expected_hash {
         return false;
     }
 
@@ -1925,12 +1908,6 @@ fn prove_affine_mul_core_with_settings(
         .ok_or_else(|| "trace is empty".to_string())?
         .acc_after_select;
     let output_compressed = final_point.compress();
-    let reference_output = reference_scalar_mul_output(instance)
-        .ok_or_else(|| "reference scalar multiplication failed".to_string())?;
-    if output_compressed != reference_output {
-        return Err("output does not match reference scalar multiplication".to_string());
-    }
-
     let main = build_main_trace(&trace, &deltas);
     let preprocessed =
         build_core_preprocessed_trace(instance.scalar_le_bytes, &trace, final_point, &deltas);
@@ -1972,10 +1949,16 @@ fn verify_affine_mul_core_with_settings(
     if final_point.compress() != proof.output_compressed {
         return false;
     }
-    let Some(reference_output) = reference_scalar_mul_output(instance) else {
-        return false;
+    let expected_hash = match statement_hash(
+        instance,
+        proof.output_compressed,
+        settings,
+        &proof.preprocessed_vk,
+    ) {
+        Ok(h) => h,
+        Err(_) => return false,
     };
-    if reference_output != proof.output_compressed {
+    if proof.statement_hash != expected_hash {
         return false;
     }
 
