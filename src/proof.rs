@@ -238,6 +238,12 @@ pub struct AffineMulE2eProofBlob {
     pub sealed_proof: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AffineMulSingleProofBlob {
+    pub sealed_instance: Vec<u8>,
+    pub sealed_proof: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AffineMulCodecError {
     InvalidInstanceLength { expected: usize, got: usize },
@@ -747,6 +753,17 @@ fn meets_minimum_arithmetic_policy(settings: SoundAddSubProofSettings) -> bool {
         && settings.num_queries >= 2
         && settings.commit_proof_of_work_bits >= 1
         && settings.query_proof_of_work_bits >= 1
+}
+
+fn core_settings_from_arithmetic(settings: SoundAddSubProofSettings) -> AffineMulProofSettings {
+    AffineMulProofSettings {
+        log_blowup: settings.log_blowup,
+        log_final_poly_len: settings.log_final_poly_len,
+        num_queries: settings.num_queries,
+        commit_proof_of_work_bits: settings.commit_proof_of_work_bits,
+        query_proof_of_work_bits: settings.query_proof_of_work_bits,
+        rng_seed: settings.rng_seed,
+    }
 }
 
 fn sampled_sound_statement_hash(
@@ -1336,11 +1353,150 @@ pub fn deserialize_affine_mul_fully_sound_bundle(
     opts.deserialize(payload).map_err(|e| e.to_string())
 }
 
+pub fn prove_affine_mul_single_proof(
+    instance: AffineMulInstance,
+) -> Result<AffineMulSingleProofBlob, String> {
+    prove_affine_mul_single_proof_with_settings(instance, AffineMulProofSettings::default())
+}
+
+pub fn prove_affine_mul_single_proof_with_settings(
+    instance: AffineMulInstance,
+    settings: AffineMulProofSettings,
+) -> Result<AffineMulSingleProofBlob, String> {
+    let proof = prove_affine_mul_core_with_settings(instance, settings)?;
+    Ok(AffineMulSingleProofBlob {
+        sealed_instance: serialize_affine_mul_instance_compressed(&instance),
+        sealed_proof: serialize_affine_mul_proof(&proof)?,
+    })
+}
+
+pub fn verify_affine_mul_single_proof(blob: &AffineMulSingleProofBlob) -> bool {
+    verify_affine_mul_single_proof_with_settings(blob, AffineMulProofSettings::default())
+}
+
+pub fn verify_affine_mul_single_proof_with_settings(
+    blob: &AffineMulSingleProofBlob,
+    settings: AffineMulProofSettings,
+) -> bool {
+    let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
+        return false;
+    };
+    let Ok(proof) = deserialize_affine_mul_proof(&blob.sealed_proof) else {
+        return false;
+    };
+    verify_affine_mul_core_with_settings(instance, &proof, settings)
+}
+
+pub fn serialize_affine_mul_single_proof_blob(
+    blob: &AffineMulSingleProofBlob,
+) -> Result<Vec<u8>, String> {
+    let bytes = bincode::serialize(blob).map_err(|e| e.to_string())?;
+    if bytes.len() > 2 * MAX_PROOF_BYTES {
+        return Err("serialized single-proof blob exceeds configured size limit".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn deserialize_affine_mul_single_proof_blob(
+    bytes: &[u8],
+) -> Result<AffineMulSingleProofBlob, String> {
+    if bytes.len() > 2 * MAX_PROOF_BYTES {
+        return Err("serialized single-proof blob exceeds configured size limit".to_string());
+    }
+    let opts = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit((2 * MAX_PROOF_BYTES) as u64);
+    opts.deserialize(bytes).map_err(|e| e.to_string())
+}
+
+pub fn prove_affine_mul_single_unified(instance: AffineMulInstance) -> Result<Vec<u8>, String> {
+    let blob = prove_affine_mul_single_proof(instance)?;
+    serialize_affine_mul_single_proof_blob(&blob)
+}
+
+pub fn prove_affine_mul_single_unified_with_settings(
+    instance: AffineMulInstance,
+    settings: AffineMulProofSettings,
+) -> Result<Vec<u8>, String> {
+    let blob = prove_affine_mul_single_proof_with_settings(instance, settings)?;
+    serialize_affine_mul_single_proof_blob(&blob)
+}
+
+pub fn verify_affine_mul_single_unified(bytes: &[u8]) -> bool {
+    let Ok(blob) = deserialize_affine_mul_single_proof_blob(bytes) else {
+        return false;
+    };
+    verify_affine_mul_single_proof(&blob)
+}
+
+pub fn verify_affine_mul_single_unified_with_settings(
+    bytes: &[u8],
+    settings: AffineMulProofSettings,
+) -> bool {
+    let Ok(blob) = deserialize_affine_mul_single_proof_blob(bytes) else {
+        return false;
+    };
+    verify_affine_mul_single_proof_with_settings(&blob, settings)
+}
+
+pub fn prove_basepoint_affine_mul_single_unified(
+    scalar_le_bytes: [u8; 32],
+) -> Result<Vec<u8>, String> {
+    prove_affine_mul_single_unified(AffineMulInstance {
+        base: ed25519_basepoint_affine(),
+        scalar_le_bytes,
+    })
+}
+
+pub fn prove_basepoint_affine_mul_single_unified_with_settings(
+    scalar_le_bytes: [u8; 32],
+    settings: AffineMulProofSettings,
+) -> Result<Vec<u8>, String> {
+    prove_affine_mul_single_unified_with_settings(
+        AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes,
+        },
+        settings,
+    )
+}
+
+pub fn verify_basepoint_affine_mul_single_unified(scalar_le_bytes: [u8; 32], bytes: &[u8]) -> bool {
+    let Ok(blob) = deserialize_affine_mul_single_proof_blob(bytes) else {
+        return false;
+    };
+    let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
+        return false;
+    };
+    if instance.base != ed25519_basepoint_affine() || instance.scalar_le_bytes != scalar_le_bytes {
+        return false;
+    }
+    verify_affine_mul_single_proof(&blob)
+}
+
+pub fn verify_basepoint_affine_mul_single_unified_with_settings(
+    scalar_le_bytes: [u8; 32],
+    bytes: &[u8],
+    settings: AffineMulProofSettings,
+) -> bool {
+    let Ok(blob) = deserialize_affine_mul_single_proof_blob(bytes) else {
+        return false;
+    };
+    let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
+        return false;
+    };
+    if instance.base != ed25519_basepoint_affine() || instance.scalar_le_bytes != scalar_le_bytes {
+        return false;
+    }
+    verify_affine_mul_single_proof_with_settings(&blob, settings)
+}
+
 pub fn prove_affine_mul_e2e(instance: AffineMulInstance) -> Result<AffineMulE2eProofBlob, String> {
-    let bundle = prove_affine_mul_fully_sound_bundle(instance)?;
+    let blob = prove_affine_mul_single_proof(instance)?;
     Ok(AffineMulE2eProofBlob {
-        sealed_instance: bundle.sealed_instance,
-        sealed_proof: bundle.sealed_proof,
+        sealed_instance: blob.sealed_instance,
+        sealed_proof: blob.sealed_proof,
     })
 }
 
@@ -1348,10 +1504,11 @@ pub fn prove_affine_mul_e2e_with_settings(
     instance: AffineMulInstance,
     arithmetic_settings: SoundAddSubProofSettings,
 ) -> Result<AffineMulE2eProofBlob, String> {
-    let bundle = prove_affine_mul_fully_sound_bundle_with_settings(instance, arithmetic_settings)?;
+    let core_settings = core_settings_from_arithmetic(arithmetic_settings);
+    let blob = prove_affine_mul_single_proof_with_settings(instance, core_settings)?;
     Ok(AffineMulE2eProofBlob {
-        sealed_instance: bundle.sealed_instance,
-        sealed_proof: bundle.sealed_proof,
+        sealed_instance: blob.sealed_instance,
+        sealed_proof: blob.sealed_proof,
     })
 }
 
@@ -1359,10 +1516,10 @@ pub fn verify_affine_mul_e2e(blob: &AffineMulE2eProofBlob) -> bool {
     let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
         return false;
     };
-    let Ok(proof) = deserialize_affine_mul_fully_sound_proof(&blob.sealed_proof) else {
+    let Ok(proof) = deserialize_affine_mul_proof(&blob.sealed_proof) else {
         return false;
     };
-    verify_affine_mul_fully_sound(instance, &proof)
+    verify_affine_mul_core_with_settings(instance, &proof, AffineMulProofSettings::default())
 }
 
 pub fn verify_affine_mul_e2e_with_settings(
@@ -1372,10 +1529,11 @@ pub fn verify_affine_mul_e2e_with_settings(
     let Ok(instance) = deserialize_affine_mul_instance_auto(&blob.sealed_instance) else {
         return false;
     };
-    let Ok(proof) = deserialize_affine_mul_fully_sound_proof(&blob.sealed_proof) else {
+    let Ok(proof) = deserialize_affine_mul_proof(&blob.sealed_proof) else {
         return false;
     };
-    verify_affine_mul_fully_sound_with_settings(instance, &proof, arithmetic_settings)
+    let core_settings = core_settings_from_arithmetic(arithmetic_settings);
+    verify_affine_mul_core_with_settings(instance, &proof, core_settings)
 }
 
 pub fn serialize_affine_mul_e2e_blob(blob: &AffineMulE2eProofBlob) -> Result<Vec<u8>, String> {

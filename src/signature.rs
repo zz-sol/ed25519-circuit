@@ -1,16 +1,12 @@
 use crate::affine::{AffinePoint, ed25519_basepoint_affine};
 use crate::proof::{
-    AffineMulInstance, deserialize_affine_mul_e2e_blob, deserialize_affine_mul_instance_auto,
-    prove_affine_mul_e2e_unified_with_settings,
-    prove_basepoint_affine_mul_e2e_unified_with_settings,
-    verify_affine_mul_e2e_unified_with_settings,
-    verify_basepoint_affine_mul_e2e_unified_with_settings,
+    AffineMulInstance, AffineMulProofSettings, deserialize_affine_mul_instance_auto,
+    deserialize_affine_mul_proof, deserialize_affine_mul_single_proof_blob,
+    prove_affine_mul_single_unified_with_settings,
+    prove_basepoint_affine_mul_single_unified_with_settings,
+    verify_affine_mul_single_unified_with_settings,
+    verify_basepoint_affine_mul_single_unified_with_settings,
 };
-use crate::sound_affine::{
-    deserialize_sound_affine_add_proof, prove_affine_add_sound_with_settings,
-    serialize_sound_affine_add_proof, verify_affine_add_sound_with_settings,
-};
-use crate::sound_nonnative::SoundAddSubProofSettings;
 use bincode::Options;
 use curve25519::edwards::CompressedEdwardsY;
 use curve25519::scalar::Scalar;
@@ -28,15 +24,13 @@ pub enum Ed25519VerificationPolicy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ed25519SignatureProofSettings {
-    pub mul_arithmetic: SoundAddSubProofSettings,
-    pub arithmetic: SoundAddSubProofSettings,
+    pub mul_core: AffineMulProofSettings,
 }
 
 impl Default for Ed25519SignatureProofSettings {
     fn default() -> Self {
         Self {
-            mul_arithmetic: SoundAddSubProofSettings::default(),
-            arithmetic: SoundAddSubProofSettings::default(),
+            mul_core: AffineMulProofSettings::default(),
         }
     }
 }
@@ -51,20 +45,11 @@ pub struct Ed25519SignatureEquationProof {
     pub k_scalar_le_bytes: [u8; 32],
     pub s_mul_base_proof: Vec<u8>,
     pub k_mul_public_key_proof: Vec<u8>,
-    pub r_plus_k_a_proof: Vec<u8>,
     pub statement_hash: [u8; 32],
     pub settings: Ed25519SignatureProofSettings,
 }
 
-fn check_minimum_mul_policy(settings: SoundAddSubProofSettings) -> bool {
-    settings.log_final_poly_len >= 4
-        && settings.log_blowup >= 3
-        && settings.num_queries >= 2
-        && settings.commit_proof_of_work_bits >= 1
-        && settings.query_proof_of_work_bits >= 1
-}
-
-fn check_minimum_arithmetic_policy(settings: SoundAddSubProofSettings) -> bool {
+fn check_minimum_mul_policy(settings: AffineMulProofSettings) -> bool {
     settings.log_final_poly_len >= 4
         && settings.log_blowup >= 3
         && settings.num_queries >= 2
@@ -151,6 +136,19 @@ fn signature_statement_hash(
     Ok(hasher.finalize().into())
 }
 
+fn output_point_from_single_blob(
+    proof_bytes: &[u8],
+    expected_instance: AffineMulInstance,
+) -> Option<AffinePoint> {
+    let blob = deserialize_affine_mul_single_proof_blob(proof_bytes).ok()?;
+    let instance = deserialize_affine_mul_instance_auto(&blob.sealed_instance).ok()?;
+    if instance != expected_instance {
+        return None;
+    }
+    let proof = deserialize_affine_mul_proof(&blob.sealed_proof).ok()?;
+    AffinePoint::from_compressed_bytes_strict(proof.output_compressed)
+}
+
 pub fn prove_ed25519_signature_equation_with_settings(
     public_key_compressed: [u8; 32],
     r_compressed: [u8; 32],
@@ -159,11 +157,8 @@ pub fn prove_ed25519_signature_equation_with_settings(
     policy: Ed25519VerificationPolicy,
     settings: Ed25519SignatureProofSettings,
 ) -> Result<Ed25519SignatureEquationProof, String> {
-    if !check_minimum_mul_policy(settings.mul_arithmetic) {
+    if !check_minimum_mul_policy(settings.mul_core) {
         return Err("insufficient scalar-mul proof settings for sound policy".to_string());
-    }
-    if !check_minimum_arithmetic_policy(settings.arithmetic) {
-        return Err("insufficient affine-add proof settings for sound policy".to_string());
     }
     if !is_canonical_scalar_mod_l(s_scalar_le_bytes) {
         return Err("S scalar is not canonical (must satisfy S < L)".to_string());
@@ -179,28 +174,25 @@ pub fn prove_ed25519_signature_equation_with_settings(
     let k_scalar_le_bytes =
         derive_ed25519_challenge_scalar_mod_l(r_compressed, public_key_compressed, message);
 
-    let s_mul_base_proof = prove_basepoint_affine_mul_e2e_unified_with_settings(
+    let s_mul_base_proof = prove_basepoint_affine_mul_single_unified_with_settings(
         s_scalar_le_bytes,
-        settings.mul_arithmetic,
+        settings.mul_core,
     )?;
     let k_mul_public_key_instance = AffineMulInstance {
         base: public_key,
         scalar_le_bytes: k_scalar_le_bytes,
     };
-    let k_mul_public_key_proof = prove_affine_mul_e2e_unified_with_settings(
+    let k_mul_public_key_proof = prove_affine_mul_single_unified_with_settings(
         k_mul_public_key_instance,
-        settings.mul_arithmetic,
+        settings.mul_core,
     )?;
 
     let s_mul_base = ed25519_basepoint_affine().scalar_mul(s_scalar_le_bytes);
     let k_mul_public_key = public_key.scalar_mul(k_scalar_le_bytes);
-    let r_plus_k_a =
-        prove_affine_add_sound_with_settings(r_point, k_mul_public_key, settings.arithmetic)?;
-    if r_plus_k_a.out != s_mul_base {
+    if r_point.add(k_mul_public_key) != s_mul_base {
         return Err("signature equation does not hold: [S]B != R + [k]A".to_string());
     }
 
-    let r_plus_k_a_proof = serialize_sound_affine_add_proof(&r_plus_k_a)?;
     let statement_hash = signature_statement_hash(
         policy,
         public_key_compressed,
@@ -220,7 +212,6 @@ pub fn prove_ed25519_signature_equation_with_settings(
         k_scalar_le_bytes,
         s_mul_base_proof,
         k_mul_public_key_proof,
-        r_plus_k_a_proof,
         statement_hash,
         settings,
     })
@@ -250,9 +241,7 @@ pub fn verify_ed25519_signature_equation_with_settings(
     if proof.settings != settings {
         return false;
     }
-    if !check_minimum_mul_policy(settings.mul_arithmetic)
-        || !check_minimum_arithmetic_policy(settings.arithmetic)
-    {
+    if !check_minimum_mul_policy(settings.mul_core) {
         return false;
     }
     if !is_canonical_scalar_mod_l(proof.s_scalar_le_bytes) {
@@ -291,10 +280,10 @@ pub fn verify_ed25519_signature_equation_with_settings(
         return false;
     };
 
-    if !verify_basepoint_affine_mul_e2e_unified_with_settings(
+    if !verify_basepoint_affine_mul_single_unified_with_settings(
         proof.s_scalar_le_bytes,
         &proof.s_mul_base_proof,
-        settings.mul_arithmetic,
+        settings.mul_core,
     ) {
         return false;
     }
@@ -302,34 +291,28 @@ pub fn verify_ed25519_signature_equation_with_settings(
         base: public_key,
         scalar_le_bytes: proof.k_scalar_le_bytes,
     };
-    let Ok(k_mul_blob) = deserialize_affine_mul_e2e_blob(&proof.k_mul_public_key_proof) else {
-        return false;
-    };
-    let Ok(k_mul_instance) = deserialize_affine_mul_instance_auto(&k_mul_blob.sealed_instance)
-    else {
-        return false;
-    };
-    if k_mul_instance != k_mul_public_key_instance {
-        return false;
-    }
-    if !verify_affine_mul_e2e_unified_with_settings(
+    if !verify_affine_mul_single_unified_with_settings(
         &proof.k_mul_public_key_proof,
-        settings.mul_arithmetic,
+        settings.mul_core,
     ) {
         return false;
     }
 
-    let add_proof = match deserialize_sound_affine_add_proof(&proof.r_plus_k_a_proof) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if !verify_affine_add_sound_with_settings(&add_proof, settings.arithmetic) {
+    let Some(s_mul_base) = output_point_from_single_blob(
+        &proof.s_mul_base_proof,
+        AffineMulInstance {
+            base: ed25519_basepoint_affine(),
+            scalar_le_bytes: proof.s_scalar_le_bytes,
+        },
+    ) else {
         return false;
-    }
-
-    let s_mul_base = ed25519_basepoint_affine().scalar_mul(proof.s_scalar_le_bytes);
-    let k_mul_public_key = public_key.scalar_mul(proof.k_scalar_le_bytes);
-    add_proof.lhs == r_point && add_proof.rhs == k_mul_public_key && add_proof.out == s_mul_base
+    };
+    let Some(k_mul_public_key) =
+        output_point_from_single_blob(&proof.k_mul_public_key_proof, k_mul_public_key_instance)
+    else {
+        return false;
+    };
+    r_point.add(k_mul_public_key) == s_mul_base
 }
 
 pub fn verify_ed25519_signature_equation(proof: &Ed25519SignatureEquationProof) -> bool {
@@ -439,7 +422,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expensive: generates multiple nested STARK proofs"]
     fn signature_equation_proof_roundtrip() {
         let a_secret = Scalar::from(123u64);
         let r_nonce = Scalar::from(45u64);
@@ -470,7 +452,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expensive: generates multiple nested STARK proofs"]
     fn signature_equation_proof_rejects_tamper() {
         let base = ed25519_basepoint_affine();
         let public_key = base.scalar_mul(scalar_from_u64(3)).compress();
