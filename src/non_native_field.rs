@@ -4,6 +4,8 @@ use p3_baby_bear::BabyBear;
 use p3_field::PrimeField64;
 use rand::RngCore;
 
+pub mod air;
+pub mod proof;
 pub mod sound;
 
 pub const LIMB_BITS: usize = 16;
