@@ -4,6 +4,7 @@ use p3_field::PrimeField64;
 use std::collections::HashSet;
 
 use crate::lookup::{LookupEvent, RangeLookupTable};
+use crate::non_native_field::air::FieldAirOp;
 use crate::non_native_field::{Ed25519BaseField, LIMB_BITS, N_LIMBS};
 
 const BASE: i128 = 1i128 << LIMB_BITS;
@@ -47,6 +48,7 @@ struct MulWitness {
 pub struct SoundFieldChip {
     table: RangeLookupTable,
     lookup_log: Vec<LookupEvent>,
+    op_log: Vec<FieldAirOp>,
     introduced_values: HashSet<[u16; N_LIMBS]>,
     add_carry_transition_table: SignedCarryTransitionLookupTable,
     mul_carry_transition_table: SignedCarryTransitionLookupTable,
@@ -63,6 +65,7 @@ impl SoundFieldChip {
         Self {
             table: RangeLookupTable::new(limb_bits),
             lookup_log: Vec::new(),
+            op_log: Vec::new(),
             introduced_values: HashSet::new(),
             add_carry_transition_table: SignedCarryTransitionLookupTable::new(
                 -(ADD_CARRY_BOUND as i128),
@@ -79,12 +82,21 @@ impl SoundFieldChip {
         &self.lookup_log
     }
 
+    pub fn field_ops(&self) -> &[FieldAirOp] {
+        &self.op_log
+    }
+
+    pub fn take_field_ops(&mut self) -> Vec<FieldAirOp> {
+        std::mem::take(&mut self.op_log)
+    }
+
     pub fn clear_lookup_log(&mut self) {
         self.lookup_log.clear();
     }
 
     pub fn clear_trace_cache(&mut self) {
         self.clear_lookup_log();
+        self.op_log.clear();
         self.introduced_values.clear();
     }
 
@@ -144,6 +156,10 @@ impl SoundFieldChip {
         let out_limbs = to_u16_limbs(&out);
         self.introduce_limbs(&out_limbs)?;
         self.verify_add_constraints(&a_limbs, &b_limbs, &out_limbs, &witness)?;
+        self.op_log.push(FieldAirOp::Add {
+            a: lhs.clone(),
+            b: rhs.clone(),
+        });
 
         Ok(SoundFieldOpOutput {
             value: out,
@@ -166,6 +182,10 @@ impl SoundFieldChip {
 
         self.introduce_limbs(&out_limbs)?;
         self.verify_mul_constraints(&a_limbs, &b_limbs, &out_limbs, &witness)?;
+        self.op_log.push(FieldAirOp::Mul {
+            a: lhs.clone(),
+            b: rhs.clone(),
+        });
 
         Ok(SoundFieldOpOutput {
             value: out,
@@ -534,6 +554,7 @@ mod tests {
 
     use super::SoundFieldChip;
     use crate::non_native_field::Ed25519BaseField;
+    use crate::non_native_field::air::FieldAirOp;
 
     #[test]
     fn randomized_sound_add_matches_reference() {
@@ -595,5 +616,37 @@ mod tests {
         let second = chip.lookup_events().len();
         // Second add should only introduce the new output value in steady state.
         assert!(second <= first + 16);
+    }
+
+    #[test]
+    fn field_op_log_tracks_verified_ops() {
+        let mut rng = SmallRng::seed_from_u64(0xa1b2_c3d4_e5f6_0718);
+        let a = Ed25519BaseField::random(&mut rng);
+        let b = Ed25519BaseField::random(&mut rng);
+        let c = Ed25519BaseField::random(&mut rng);
+        let mut chip = SoundFieldChip::default();
+
+        let _ = chip.add_sound(&a, &b).expect("add sound");
+        let _ = chip.mul_sound(&b, &c).expect("mul sound");
+
+        let ops = chip.field_ops();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], FieldAirOp::Add { .. }));
+        assert!(matches!(ops[1], FieldAirOp::Mul { .. }));
+    }
+
+    #[test]
+    fn take_field_ops_drains_log() {
+        let mut rng = SmallRng::seed_from_u64(0x8877_6655_4433_2211);
+        let a = Ed25519BaseField::random(&mut rng);
+        let b = Ed25519BaseField::random(&mut rng);
+        let mut chip = SoundFieldChip::default();
+
+        let _ = chip.add_sound(&a, &b).expect("add sound");
+        assert_eq!(chip.field_ops().len(), 1);
+
+        let taken = chip.take_field_ops();
+        assert_eq!(taken.len(), 1);
+        assert!(chip.field_ops().is_empty());
     }
 }

@@ -6,15 +6,13 @@ use p3_field::PrimeCharacteristicRing;
 use p3_field::extension::BinomialExtensionField;
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_keccak::Keccak256Hash;
-use p3_matrix::Matrix;
-use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
 use p3_uni_stark::{Proof, StarkConfig, prove, verify};
 
 use crate::non_native_field::air::{
-    FieldAirOp, NON_NATIVE_FIELD_AIR_WIDTH, NON_NATIVE_FIELD_NUM_PUBLIC_VALUES, NonNativeFieldAir,
-    build_trace_for_ops, compute_trace_public_values,
+    FieldAirOp, NON_NATIVE_FIELD_NUM_PUBLIC_VALUES, NonNativeFieldAir, build_trace_for_ops,
+    compute_trace_public_values_with_seed, pad_trace_for_proof, rechain_trace_acc_with_seed,
 };
 
 pub type Val = BabyBear;
@@ -64,14 +62,27 @@ pub fn prove_field_air_ops(ops: &[FieldAirOp]) -> FieldAirProof {
     prove_field_air_ops_with_settings(ops, FieldAirProofSettings::default())
 }
 
+pub fn prove_field_air_ops_with_seed(ops: &[FieldAirOp], seed: BabyBear) -> FieldAirProof {
+    prove_field_air_ops_with_settings_and_seed(ops, FieldAirProofSettings::default(), seed)
+}
+
 pub fn prove_field_air_ops_with_settings(
     ops: &[FieldAirOp],
     settings: FieldAirProofSettings,
 ) -> FieldAirProof {
+    prove_field_air_ops_with_settings_and_seed(ops, settings, BabyBear::ZERO)
+}
+
+pub fn prove_field_air_ops_with_settings_and_seed(
+    ops: &[FieldAirOp],
+    settings: FieldAirProofSettings,
+    seed: BabyBear,
+) -> FieldAirProof {
     let config = setup_config(settings);
     let air = NonNativeFieldAir;
-    let trace = pad_trace_to_power_of_two(build_trace_for_ops(ops));
-    let public_values = compute_trace_public_values(&trace);
+    let trace = rechain_trace_acc_with_seed(build_trace_for_ops(ops), seed);
+    let trace = pad_trace_for_proof(trace, 8);
+    let public_values = compute_trace_public_values_with_seed(&trace, seed);
     let proof = prove(&config, &air, trace, &public_values);
     FieldAirProof {
         proof,
@@ -94,8 +105,20 @@ pub fn verify_field_air_proof_with_settings(
 }
 
 pub fn verify_field_air_proof_for_ops(proof: &FieldAirProof, ops: &[FieldAirOp]) -> bool {
-    let trace = pad_trace_to_power_of_two(build_trace_for_ops(ops));
-    let expected = compute_trace_public_values(&trace);
+    verify_field_air_proof_for_ops_with_seed(proof, ops, BabyBear::ZERO)
+}
+
+pub fn verify_field_air_proof_for_ops_with_seed(
+    proof: &FieldAirProof,
+    ops: &[FieldAirOp],
+    seed: BabyBear,
+) -> bool {
+    if proof.public_values[8] != seed {
+        return false;
+    }
+    let trace = pad_trace_for_proof(build_trace_for_ops(ops), 8);
+    let trace = rechain_trace_acc_with_seed(trace, seed);
+    let expected = compute_trace_public_values_with_seed(&trace, seed);
     if proof.public_values != expected {
         return false;
     }
@@ -121,26 +144,15 @@ fn setup_config(settings: FieldAirProofSettings) -> FieldAirStarkConfig {
     StarkConfig::new(pcs, challenger)
 }
 
-fn pad_trace_to_power_of_two(mut trace: RowMajorMatrix<BabyBear>) -> RowMajorMatrix<BabyBear> {
-    let width = NON_NATIVE_FIELD_AIR_WIDTH;
-    let height = trace.height();
-    let target = height.max(8).next_power_of_two();
-    if height == target {
-        return trace;
-    }
-
-    trace
-        .values
-        .extend(vec![BabyBear::ZERO; (target - height) * width]);
-    RowMajorMatrix::new(trace.values, width)
-}
-
 #[cfg(test)]
 mod tests {
+    use p3_baby_bear::BabyBear;
+    use p3_field::PrimeCharacteristicRing;
     use rand::{SeedableRng, rngs::SmallRng};
 
     use super::{
-        FieldAirProofSettings, prove_field_air_ops, verify_field_air_proof,
+        FieldAirProofSettings, prove_field_air_ops, prove_field_air_ops_with_seed,
+        verify_field_air_proof, verify_field_air_proof_for_ops_with_seed,
         verify_field_air_proof_with_settings,
     };
     use crate::non_native_field::Ed25519BaseField;
@@ -177,5 +189,23 @@ mod tests {
             ..proof.settings
         };
         assert!(!verify_field_air_proof_with_settings(&proof, bad));
+    }
+
+    #[test]
+    fn seeded_statement_binding_roundtrip() {
+        let mut rng = SmallRng::seed_from_u64(0x5555_aaaa_6666_bbbb);
+        let a = Ed25519BaseField::random(&mut rng);
+        let b = Ed25519BaseField::random(&mut rng);
+        let ops = vec![FieldAirOp::Add { a, b }];
+        let seed = BabyBear::from_u32(123456);
+
+        let proof = prove_field_air_ops_with_seed(&ops, seed);
+        assert!(verify_field_air_proof(&proof));
+        assert!(verify_field_air_proof_for_ops_with_seed(&proof, &ops, seed));
+        assert!(!verify_field_air_proof_for_ops_with_seed(
+            &proof,
+            &ops,
+            BabyBear::from_u32(7)
+        ));
     }
 }

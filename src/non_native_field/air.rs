@@ -17,9 +17,12 @@ const OUT_BASE: usize = B_BASE + N_LIMBS;
 const ADD_CARRY_BASE: usize = OUT_BASE + N_LIMBS;
 const PROD_BASE: usize = ADD_CARRY_BASE + (N_LIMBS + 1);
 const MUL_CARRY_BASE: usize = PROD_BASE + 32;
+const ACC_COL: usize = MUL_CARRY_BASE + 32;
+const TRACE_ACC_ALPHA: u32 = 97;
+const SEED_PV_COL: usize = 8;
 
-pub const NON_NATIVE_FIELD_AIR_WIDTH: usize = MUL_CARRY_BASE + 32;
-pub const NON_NATIVE_FIELD_NUM_PUBLIC_VALUES: usize = 7;
+pub const NON_NATIVE_FIELD_AIR_WIDTH: usize = ACC_COL + 1;
+pub const NON_NATIVE_FIELD_NUM_PUBLIC_VALUES: usize = 9;
 
 #[derive(Clone, Debug)]
 pub enum FieldAirOp {
@@ -64,9 +67,25 @@ impl<AB: AirBuilderWithPublicValues<F = BabyBear>> Air<AB> for NonNativeFieldAir
         constrain_add_row::<AB>(builder, &row, sel_add.clone().into());
         constrain_mul_row::<AB>(builder, &row, sel_mul.clone().into());
 
+        let row_fp = row_fingerprint_expr::<AB>(&row);
         let public = builder.public_values().to_vec();
+        let seed: AB::Expr = public[SEED_PV_COL].into();
+        let mut first_row = builder.when_first_row();
+        first_row.assert_eq(
+            row[ACC_COL].clone(),
+            seed * BabyBear::from_u32(TRACE_ACC_ALPHA) + row_fp.clone(),
+        );
+        if let Some(next) = main.row_slice(1) {
+            let mut transition = builder.when_transition();
+            transition.assert_eq(
+                next[ACC_COL].clone(),
+                row[ACC_COL].clone() * BabyBear::from_u32(TRACE_ACC_ALPHA)
+                    + row_fingerprint_expr::<AB>(&next),
+            );
+        }
+
         let mut first = builder.when_first_row();
-        first.assert_eq(public[0].clone(), row_fingerprint_expr::<AB>(&row));
+        first.assert_eq(public[0].clone(), row_fp);
         first.assert_eq(public[1].clone(), pack_limbs_expr::<AB>(&row, A_BASE));
         first.assert_eq(public[2].clone(), pack_limbs_expr::<AB>(&row, B_BASE));
 
@@ -75,6 +94,7 @@ impl<AB: AirBuilderWithPublicValues<F = BabyBear>> Air<AB> for NonNativeFieldAir
         last.assert_eq(public[4].clone(), row[SEL_ADD_COL].clone());
         last.assert_eq(public[5].clone(), row[SEL_MUL_COL].clone());
         last.assert_eq(public[6].clone(), row[Q_COL].clone());
+        last.assert_eq(public[7].clone(), row[ACC_COL].clone());
     }
 }
 
@@ -216,6 +236,7 @@ pub fn build_add_row(a: &Ed25519BaseField, b: &Ed25519BaseField) -> Vec<BabyBear
     for i in 0..=N_LIMBS {
         row[ADD_CARRY_BASE + i] = BabyBear::from_i64(carries[i]);
     }
+    row[ACC_COL] = row_fingerprint_value(&row);
     row
 }
 
@@ -280,17 +301,30 @@ pub fn build_mul_row(a: &Ed25519BaseField, b: &Ed25519BaseField) -> Vec<BabyBear
     for i in 0..32 {
         row[MUL_CARRY_BASE + i] = BabyBear::from_i64(carries[i]);
     }
+    row[ACC_COL] = row_fingerprint_value(&row);
 
     row
 }
 
 pub fn build_trace_for_ops(ops: &[FieldAirOp]) -> RowMajorMatrix<BabyBear> {
-    let mut values = Vec::with_capacity(ops.len() * NON_NATIVE_FIELD_AIR_WIDTH);
+    let mut rows = Vec::with_capacity(ops.len());
     for op in ops {
         let row = match op {
             FieldAirOp::Add { a, b } => build_add_row(a, b),
             FieldAirOp::Mul { a, b } => build_mul_row(a, b),
         };
+        rows.push(row);
+    }
+    if !rows.is_empty() {
+        rows[0][ACC_COL] = row_fingerprint_value(&rows[0]);
+        for i in 1..rows.len() {
+            rows[i][ACC_COL] = rows[i - 1][ACC_COL] * BabyBear::from_u32(TRACE_ACC_ALPHA)
+                + row_fingerprint_value(&rows[i]);
+        }
+    }
+
+    let mut values = Vec::with_capacity(ops.len() * NON_NATIVE_FIELD_AIR_WIDTH);
+    for row in rows {
         values.extend_from_slice(&row);
     }
     RowMajorMatrix::new(values, NON_NATIVE_FIELD_AIR_WIDTH)
@@ -299,8 +333,16 @@ pub fn build_trace_for_ops(ops: &[FieldAirOp]) -> RowMajorMatrix<BabyBear> {
 pub fn compute_trace_public_values(
     trace: &RowMajorMatrix<BabyBear>,
 ) -> [BabyBear; NON_NATIVE_FIELD_NUM_PUBLIC_VALUES] {
+    compute_trace_public_values_with_seed(trace, BabyBear::ZERO)
+}
+
+pub fn compute_trace_public_values_with_seed(
+    trace: &RowMajorMatrix<BabyBear>,
+    seed: BabyBear,
+) -> [BabyBear; NON_NATIVE_FIELD_NUM_PUBLIC_VALUES] {
     let mut out = [BabyBear::ZERO; NON_NATIVE_FIELD_NUM_PUBLIC_VALUES];
     if trace.height() == 0 {
+        out[SEED_PV_COL] = seed;
         return out;
     }
 
@@ -314,17 +356,91 @@ pub fn compute_trace_public_values(
     out[4] = last[SEL_ADD_COL];
     out[5] = last[SEL_MUL_COL];
     out[6] = last[Q_COL];
+    out[7] = seed_trace_acc(trace, seed);
+    out[SEED_PV_COL] = seed;
     out
 }
 
+fn seed_trace_acc(trace: &RowMajorMatrix<BabyBear>, seed: BabyBear) -> BabyBear {
+    if trace.height() == 0 {
+        return seed;
+    }
+
+    let mut acc = seed;
+    for i in 0..trace.height() {
+        let row = trace.row_slice(i).expect("row");
+        acc = acc * BabyBear::from_u32(TRACE_ACC_ALPHA) + row_fingerprint_value(&row);
+    }
+    acc
+}
+
+pub fn pad_trace_for_proof(
+    mut trace: RowMajorMatrix<BabyBear>,
+    min_height: usize,
+) -> RowMajorMatrix<BabyBear> {
+    let width = NON_NATIVE_FIELD_AIR_WIDTH;
+    let height = trace.height();
+    let target = height.max(min_height).next_power_of_two();
+    if height == target {
+        return trace;
+    }
+
+    let mut acc = if height == 0 {
+        BabyBear::ZERO
+    } else {
+        trace.row_slice(height - 1).expect("last row")[ACC_COL]
+    };
+    for _ in height..target {
+        acc *= BabyBear::from_u32(TRACE_ACC_ALPHA);
+        let mut row = vec![BabyBear::ZERO; width];
+        row[ACC_COL] = acc;
+        trace.values.extend_from_slice(&row);
+    }
+    RowMajorMatrix::new(trace.values, width)
+}
+
+pub fn rechain_trace_acc_with_seed(
+    mut trace: RowMajorMatrix<BabyBear>,
+    seed: BabyBear,
+) -> RowMajorMatrix<BabyBear> {
+    if trace.height() == 0 {
+        return trace;
+    }
+    let width = NON_NATIVE_FIELD_AIR_WIDTH;
+    let mut acc = seed;
+    for r in 0..trace.height() {
+        let row = trace.row_slice(r).expect("row").to_vec();
+        acc = acc * BabyBear::from_u32(TRACE_ACC_ALPHA) + row_fingerprint_value(&row);
+        trace.values[r * width + ACC_COL] = acc;
+    }
+    RowMajorMatrix::new(trace.values, width)
+}
+
 pub fn validate_trace_rows(trace: &RowMajorMatrix<BabyBear>) -> bool {
+    validate_trace_rows_with_seed(trace, BabyBear::ZERO)
+}
+
+pub fn validate_trace_rows_with_seed(trace: &RowMajorMatrix<BabyBear>, seed: BabyBear) -> bool {
     let air = NonNativeFieldAir;
-    let public_values = compute_trace_public_values(trace);
+    let public_values = compute_trace_public_values_with_seed(trace, seed);
     for r in 0..trace.height() {
         let row = trace.row_slice(r).expect("row exists").to_vec();
+        let mut window = row.clone();
+        if r + 1 < trace.height() {
+            let next = trace.row_slice(r + 1).expect("next row exists");
+            window.extend(next.iter().copied());
+        }
         let is_first = r == 0;
         let is_last = r + 1 == trace.height();
-        if !validate_row(&air, row, public_values.to_vec(), is_first, is_last) {
+        let is_transition = r + 1 < trace.height();
+        if !validate_row(
+            &air,
+            window,
+            public_values.to_vec(),
+            is_first,
+            is_last,
+            is_transition,
+        ) {
             return false;
         }
     }
@@ -333,10 +449,11 @@ pub fn validate_trace_rows(trace: &RowMajorMatrix<BabyBear>) -> bool {
 
 fn validate_row(
     air: &NonNativeFieldAir,
-    row: Vec<BabyBear>,
+    window: Vec<BabyBear>,
     public_values: Vec<BabyBear>,
     is_first: bool,
     is_last: bool,
+    is_transition: bool,
 ) -> bool {
     #[derive(Clone)]
     struct RowChecker {
@@ -344,6 +461,7 @@ fn validate_row(
         public_values: Vec<BabyBear>,
         is_first: bool,
         is_last: bool,
+        is_transition: bool,
         violated: bool,
     }
 
@@ -371,7 +489,11 @@ fn validate_row(
             }
         }
         fn is_transition_window(&self, _size: usize) -> Self::Expr {
-            BabyBear::ZERO
+            if self.is_transition {
+                BabyBear::ONE
+            } else {
+                BabyBear::ZERO
+            }
         }
         fn assert_zero<I: Into<Self::Expr>>(&mut self, x: I) {
             if x.into() != BabyBear::ZERO {
@@ -388,12 +510,13 @@ fn validate_row(
         }
     }
 
-    let matrix = RowMajorMatrix::new(row, NON_NATIVE_FIELD_AIR_WIDTH);
+    let matrix = RowMajorMatrix::new(window, NON_NATIVE_FIELD_AIR_WIDTH);
     let mut checker = RowChecker {
         main: matrix,
         public_values,
         is_first,
         is_last,
+        is_transition,
         violated: false,
     };
     air.eval(&mut checker);
